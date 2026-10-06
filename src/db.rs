@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS adventures (
     reviews_checked_at TEXT                   -- last full reviews re-scrape
 );
 CREATE INDEX IF NOT EXISTS idx_adv_pub ON adventures(published_utc);
-CREATE INDEX IF NOT EXISTS idx_adv_status ON adventures(status);
 
 -- stages.raw_json keeps the full API stage object, including the answer
 -- hash fields (only present when fetched with a bearer token):
@@ -156,7 +155,6 @@ CREATE TABLE IF NOT EXISTS reviews (
     version_seq INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_adv ON reviews(adventure_guid);
-CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
 
 -- Never-delete version history. Each row is a snapshot of a live row as
 -- it was when superseded (updated), tombstoned (removed/deleted) or
@@ -298,6 +296,11 @@ pub struct Db {
     inner: Arc<Mutex<Connection>>,
 }
 
+/// Create an index if it isn't there yet.
+fn ensure_index(c: &Connection, ddl: &str) -> Result<()> {
+    c.execute_batch(ddl)?;
+    Ok(())
+}
 /// Add a column to an existing table if it isn't there yet.
 fn ensure_column(c: &Connection, table: &str, col: &str, ddl: &str) -> Result<()> {
     let mut stmt = c.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -340,6 +343,11 @@ impl Db {
         ensure_column(&conn, "reviews", "content_hash", "content_hash TEXT")?;
         ensure_column(&conn, "reviews", "removed_at", "removed_at TEXT")?;
         ensure_column(&conn, "reviews", "version_seq", "version_seq INTEGER")?;
+        // Indexes on the history columns. Created here (not in SCHEMA) so
+        // old databases get them after the columns above exist — a SCHEMA
+        // index on a not-yet-added column aborts the whole batch.
+        ensure_index(&conn, "CREATE INDEX IF NOT EXISTS idx_adv_status ON adventures(status)")?;
+        ensure_index(&conn, "CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status)")?;
         Ok(Self { inner: Arc::new(Mutex::new(conn)) })
     }
 
