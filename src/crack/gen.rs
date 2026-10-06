@@ -72,10 +72,10 @@ pub fn patterns() -> Vec<Candidate> {
     let mut v: Vec<Candidate> = Vec::with_capacity(6_000_000);
     // letters+digits combos, total length <= 5 per side cap (la<=3, di<=3)
     let letters: Vec<String> = (1..=3usize)
-        .flat_map(|l| alpha_strings(l))
+        .flat_map(alpha_strings)
         .collect();
     let digits: Vec<String> = (1..=3usize)
-        .flat_map(|l| digit_strings(l))
+        .flat_map(digit_strings)
         .collect();
     for la in &letters {
         for di in &digits {

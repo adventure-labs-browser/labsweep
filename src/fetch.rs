@@ -93,13 +93,13 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
                         let has_hashes = stages.is_some_and(|ss| {
                             ss.iter().any(|s| s.get("findCodeHashBase16v2").is_some())
                         });
-                        if stages.is_some_and(|ss| !ss.is_empty()) && !has_hashes {
-                            if warned
+                        if stages.is_some_and(|ss| !ss.is_empty())
+                            && !has_hashes
+                            && warned
                                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                                 .is_ok()
-                            {
-                                warn!("{guid}: no findCodeHashBase16v2 — bearer token may be expired");
-                            }
+                        {
+                            warn!("{guid}: no findCodeHashBase16v2 — bearer token may be expired");
                         }
                     }
                 }
