@@ -66,7 +66,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     reviews::run(
         db.clone(),
         reviews::Args {
-            concurrency: 32,
+            concurrency: 64,
             rate: args.reviews_rate,
             bearer: String::new(),
             max: 0,
@@ -81,7 +81,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     reviews::run(
         db.clone(),
         reviews::Args {
-            concurrency: 32,
+            concurrency: 64,
             rate: args.reviews_rate,
             bearer: String::new(),
             max: args.reviews_max,
