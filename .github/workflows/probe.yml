@@ -1,0 +1,12 @@
+name: probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          df -h / /tmp
+          free -g
+          nproc
+          ls /opt 2>/dev/null | head
