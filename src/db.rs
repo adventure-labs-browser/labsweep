@@ -1045,7 +1045,11 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
         self.run(move |c| {
             let tx = c.transaction()?;
             let mut written = 0u64;
-            tx.execute("CREATE TEMP TABLE seen_ids(id INTEGER PRIMARY KEY)", [])?;
+            // Temp tables live on the shared connection (Db serializes all
+            // access through one mutex), so reuse one table and clear it
+            // per adventure instead of creating it fresh each time.
+            tx.execute("CREATE TEMP TABLE IF NOT EXISTS seen_ids(id INTEGER PRIMARY KEY)", [])?;
+            tx.execute("DELETE FROM seen_ids", [])?;
             {
                 let mut known: std::collections::HashMap<i64, (String, Option<String>)> =
                     std::collections::HashMap::new();
