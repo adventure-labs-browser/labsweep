@@ -87,6 +87,13 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
                     return;
                 }
                 let d = client.detail(&guid).await;
+                if d.status != 200 {
+                    warn!(
+                        "{guid}: detail http {}: {}",
+                        d.status,
+                        d.error.as_deref().unwrap_or("no detail")
+                    );
+                }
                 if client.has_bearer() && !warned.load(Ordering::SeqCst) {
                     if let Some(v) = &d.json {
                         let stages = v.get("stageSummaries").and_then(|s| s.as_array());

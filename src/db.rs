@@ -633,16 +633,20 @@ impl Db {
 
     /// GUIDs still needing a detail fetch. With `require_hashes`, rows
     /// whose stored JSON lacks the answer-hash fields are re-fetched too.
+    /// Tombstoned rows are excluded — they stay dead until `refetch`
+    /// (which revisits everything stalest-first) proves otherwise.
     pub async fn pending_guids(&self, require_hashes: bool) -> Result<Vec<String>> {
         self.run(move |c| {
             let sql = if require_hashes {
                 "SELECT l.guid FROM labs l LEFT JOIN adventures a ON a.guid = l.guid \
-                 WHERE a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL \
+                 WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL \
                     OR a.raw_json NOT LIKE '%findCodeHashBase16v2%' \
-                    OR a.raw_json NOT LIKE '%answerCodeHashesBase16v2%'"
+                    OR a.raw_json NOT LIKE '%answerCodeHashesBase16v2%') \
+                   AND COALESCE(a.status,'active') = 'active'"
             } else {
                 "SELECT l.guid FROM labs l LEFT JOIN adventures a ON a.guid = l.guid \
-                 WHERE a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL"
+                 WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL) \
+                   AND COALESCE(a.status,'active') = 'active'"
             };
             let mut stmt = c.prepare(sql)?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
