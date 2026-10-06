@@ -31,6 +31,9 @@ pub struct Args {
     pub bearer: String,
     /// Process at most N adventures (0 = all pending).
     pub max: usize,
+    /// Refresh mode: re-scrape already-scraped adventures stalest-first
+    /// instead of only pending ones. Picks up new/edited/vanished reviews.
+    pub revisit: bool,
 }
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
@@ -44,7 +47,14 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         Arc::new(Client::new(args.rate, None)?)
     };
 
-    let guids = db.pending_review_guids().await?;
+    let guids = if args.revisit {
+        let lim = if args.max > 0 { args.max as i64 } else { -1 };
+        let g = db.revisit_review_guids(lim).await?;
+        info!("revisit: {total} adventures to re-scrape (stalest first)", total = g.len());
+        g
+    } else {
+        db.pending_review_guids().await?
+    };
     let total = guids.len();
     if total == 0 {
         info!("no adventures pending reviews — {}", db.stats().await?);

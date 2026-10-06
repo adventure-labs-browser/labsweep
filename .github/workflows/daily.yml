@@ -1,0 +1,71 @@
+name: daily
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fetch_max:
+        description: "Re-fetch at most N stalest details (0 = all)"
+        default: "0"
+      reviews_max:
+        description: "Re-scrape at most N stalest review sets (0 = all)"
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      - name: Restore database from rolling release
+        run: |
+          mkdir -p data
+          if gh release download db-latest -p 'labsweep.db.zst.part-*' --clobber; then
+            cat labsweep.db.zst.part-* | zstd -dc -o data/labsweep.db
+            rm -f labsweep.db.zst.part-*
+            ls -lh data/labsweep.db
+          else
+            echo "no db-latest release yet — starting from an empty database"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Log in
+        run: ./target/release/labsweep --db data/labsweep.db auth login --username "${{ secrets.LABSWEEP_USER }}" --password "${{ secrets.LABSWEEP_PASS }}"
+
+      - name: Refresh pass
+        run: ./target/release/labsweep --db data/labsweep.db refresh --fetch-max "${{ inputs.fetch_max || '0' }}" --reviews-max "${{ inputs.reviews_max || '0' }}"
+
+      - name: Strip credentials before upload
+        if: always()
+        run: ./target/release/labsweep --db data/labsweep.db auth logout || true
+
+      - name: Publish database to rolling release
+        if: always()
+        run: |
+          mkdir -p /tmp/dbparts
+          zstd -T0 data/labsweep.db -o /tmp/dbparts/labsweep.db.zst
+          (cd /tmp/dbparts && split -b 1500m labsweep.db.zst labsweep.db.zst.part- && rm labsweep.db.zst)
+          ls -lh /tmp/dbparts
+          gh release delete db-latest -y --cleanup-tag || true
+          gh release create db-latest /tmp/dbparts/labsweep.db.zst.part-* \
+            --title "labsweep db $(date -u +%F)" \
+            --notes "Rolling database snapshot. Reassemble: cat labsweep.db.zst.part-* | zstd -dc -o labsweep.db"
+        env:
+          GH_TOKEN: ${{ github.token }}
