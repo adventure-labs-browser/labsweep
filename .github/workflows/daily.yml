@@ -46,6 +46,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Migrate database
+        run: ./target/release/labsweep --db data/labsweep.db stats
+
       - name: Log in
         run: ./target/release/labsweep --db data/labsweep.db auth login --username "${{ secrets.LABSWEEP_USER }}" --password "${{ secrets.LABSWEEP_PASS }}"
 
@@ -84,9 +87,17 @@ jobs:
           zstd -T0 data/labsweep.db -o /tmp/dbparts/labsweep.db.zst
           (cd /tmp/dbparts && split -b 1500m labsweep.db.zst labsweep.db.zst.part- && rm labsweep.db.zst)
           ls -lh /tmp/dbparts
+          TAG="db-$(date -u +%F)"
+          gh release create "$TAG" /tmp/dbparts/labsweep.db.zst.part-* \
+            --title "labsweep db $(date -u +%F)" \
+            --notes "Dated snapshot, kept 7 days. Reassemble: cat labsweep.db.zst.part-* | zstd -dc -o labsweep.db" \
+            || true
           gh release delete db-latest -y --cleanup-tag || true
           gh release create db-latest /tmp/dbparts/labsweep.db.zst.part-* \
             --title "labsweep db $(date -u +%F)" \
             --notes "Rolling database snapshot. Reassemble: cat labsweep.db.zst.part-* | zstd -dc -o labsweep.db"
+          gh release list --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("db-20")) | .tagName] | sort | .[:-7] | .[]' \
+            | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
         env:
           GH_TOKEN: ${{ github.token }}
