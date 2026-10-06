@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS adventures (
     http_status INTEGER,
     error TEXT,
     fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Failure backoff (refresh mode): permanently-failing rows back off
+    -- exponentially instead of retrying every run. NULL retry = due now.
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
     -- Never-delete history (refresh mode): removals are marks, updates
     -- append to adventure_versions. NULL status on old rows == 'active'.
     status TEXT NOT NULL DEFAULT 'active',   -- active|removed|unfetched
@@ -335,6 +339,8 @@ impl Db {
         ensure_column(&conn, "adventures", "removed_at", "removed_at TEXT")?;
         ensure_column(&conn, "adventures", "version_seq", "version_seq INTEGER")?;
         ensure_column(&conn, "adventures", "reviews_checked_at", "reviews_checked_at TEXT")?;
+        ensure_column(&conn, "adventures", "failed_attempts", "failed_attempts INTEGER")?;
+        ensure_column(&conn, "adventures", "next_retry_at", "next_retry_at TEXT")?;
         ensure_column(&conn, "stages", "status", "status TEXT")?;
         ensure_column(&conn, "stages", "content_hash", "content_hash TEXT")?;
         ensure_column(&conn, "stages", "removed_at", "removed_at TEXT")?;
@@ -674,11 +680,13 @@ impl Db {
                  WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL \
                     OR a.raw_json NOT LIKE '%findCodeHashBase16v2%' \
                     OR a.raw_json NOT LIKE '%answerCodeHashesBase16v2%') \
-                   AND COALESCE(a.status,'active') = 'active'"
+                   AND COALESCE(a.status,'active') = 'active' \
+                   AND (a.next_retry_at IS NULL OR a.next_retry_at <= CURRENT_TIMESTAMP)"
             } else {
                 "SELECT l.guid FROM labs l LEFT JOIN adventures a ON a.guid = l.guid \
                  WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL) \
-                   AND COALESCE(a.status,'active') = 'active'"
+                   AND COALESCE(a.status,'active') = 'active' \
+                   AND (a.next_retry_at IS NULL OR a.next_retry_at <= CURRENT_TIMESTAMP)"
             };
             let mut stmt = c.prepare(sql)?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -743,10 +751,16 @@ impl Db {
                     } else {
                         // Transient failure (429/5xx/exhausted retries) or
                         // a row that never had good data: record the error,
-                        // preserve everything else, no version row.
+                        // preserve everything else, no version row — but
+                        // back off so a permanently-failing row isn't
+                        // retried every run (1,2,4..30 days).
                         tx.execute(
                             "UPDATE adventures SET http_status=?2, error=?3, \
-                             fetched_at=CURRENT_TIMESTAMP WHERE guid=?1",
+                             fetched_at=CURRENT_TIMESTAMP, \
+                             failed_attempts=COALESCE(failed_attempts,0)+1, \
+                             next_retry_at=datetime('CURRENT_TIMESTAMP', \
+                               '+'||min(1 << COALESCE(failed_attempts,0),30)||' days') \
+                             WHERE guid=?1",
                             params![guid, status as i64, error],
                         )?;
                     }
@@ -767,10 +781,12 @@ impl Db {
                         )?;
                         Self::update_adventure(&tx, &guid, &d, status, &hash)?;
                     } else {
-                        // Same content, still active: light touch.
+                        // Same content, still active: light touch + clear
+                        // any past failure backoff.
                         tx.execute(
                             "UPDATE adventures SET http_status=?2, error=NULL, \
-                             fetched_at=CURRENT_TIMESTAMP, content_hash=?3 \
+                             fetched_at=CURRENT_TIMESTAMP, content_hash=?3, \
+                             failed_attempts=0, next_retry_at=NULL \
                              WHERE guid=?1",
                             params![guid, status as i64, hash],
                         )?;
@@ -876,6 +892,7 @@ fn update_adventure(
            location_lat=?22, location_lon=?23, custom_access_code=?24, \
            themes_json=?25, raw_json=?26, http_status=?27, error=NULL, \
            status='active', removed_at=NULL, content_hash=?28, \
+           failed_attempts=0, next_retry_at=NULL, \
            fetched_at=CURRENT_TIMESTAMP, version_seq=COALESCE(version_seq,1)+1 \
          WHERE guid=?1",
         params![
@@ -1051,11 +1068,13 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
 }
 
     /// Adventures whose detail shows reviews and haven't been scraped.
+    /// Backed-off failures wait for next_retry_at.
     pub async fn pending_review_guids(&self) -> Result<Vec<String>> {
         self.run(|c| {
             let mut stmt = c.prepare(
                 "SELECT guid FROM adventures WHERE http_status=200 \
-                 AND COALESCE(reviews_total_count,0) > 0 AND reviews_done=0",
+                 AND COALESCE(reviews_total_count,0) > 0 AND reviews_done=0 \
+                 AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             let mut out = Vec::new();
@@ -1243,6 +1262,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             tx.execute(
                 "UPDATE adventures SET reviews_done=1, reviews_error=NULL, \
                  reviews_checked_at=CURRENT_TIMESTAMP, \
+                 failed_attempts=0, next_retry_at=NULL, \
                  reviews_total_count=MAX(COALESCE(reviews_total_count,0), ?2) \
                  WHERE guid=?1",
                 params![guid, total_count],
@@ -1253,12 +1273,51 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
         .await
     }
 
-    /// Leave the adventure pending but record why it failed.
+    /// Leave the adventure pending but record why it failed — with
+    /// exponential backoff (1,2,4..30 days) so hopeless rows don't burn
+    /// a scrape every run.
     pub async fn mark_reviews_failed(&self, guid: String, err: String) -> Result<()> {
         self.run(move |c| {
             c.execute(
-                "UPDATE adventures SET reviews_error=?2 WHERE guid=?1",
+                "UPDATE adventures SET reviews_error=?2, \
+                 failed_attempts=COALESCE(failed_attempts,0)+1, \
+                 next_retry_at=datetime('CURRENT_TIMESTAMP', \
+                   '+'||min(1 << COALESCE(failed_attempts,0),30)||' days') \
+                 WHERE guid=?1",
                 params![guid, err],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stored (reviews_total_count, max review id) for the revisit
+    /// short-circuit: if the live first page matches both, nothing
+    /// changed and the full pagination is skipped.
+    pub async fn review_state(&self, guid: String) -> Result<(i64, Option<i64>)> {
+        self.run(move |c| {
+            let total: Option<i64> = c.query_row(
+                "SELECT reviews_total_count FROM adventures WHERE guid=?1",
+                params![guid],
+                |r| r.get(0),
+            )?;
+            let max_id: Option<i64> = c.query_row(
+                "SELECT MAX(id) FROM reviews WHERE adventure_guid=?1",
+                params![guid],
+                |r| r.get(0),
+            )?;
+            Ok((total.unwrap_or(0), max_id))
+        })
+        .await
+    }
+
+    /// Record a no-change revisit without a full scrape.
+    pub async fn mark_reviews_checked(&self, guid: String) -> Result<()> {
+        self.run(move |c| {
+            c.execute(
+                "UPDATE adventures SET reviews_checked_at=CURRENT_TIMESTAMP \
+                 WHERE guid=?1",
+                params![guid],
             )?;
             Ok(())
         })
@@ -1292,6 +1351,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             let mut stmt = c.prepare(
                 "SELECT guid FROM adventures \
                  WHERE COALESCE(status,'active')='active' \
+                 AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP) \
                  ORDER BY fetched_at ASC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
@@ -1313,6 +1373,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
                 "SELECT guid FROM adventures \
                  WHERE http_status=200 AND COALESCE(status,'active')='active' \
                    AND reviews_done=1 AND COALESCE(reviews_total_count,0) > 0 \
+                   AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP) \
                  ORDER BY COALESCE(reviews_checked_at,'1970-01-01') ASC LIMIT ?1",
             )?;
             let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;

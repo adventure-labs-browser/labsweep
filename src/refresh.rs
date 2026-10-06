@@ -8,7 +8,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::{crawl, db::Db, fetch, reviews};
+use crate::{crack, crawl, db::Db, fetch, reviews};
 
 pub struct Args {
     pub crawl_rate: f64,
@@ -89,6 +89,22 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
             bearer: String::new(),
             max: args.reviews_max,
             revisit: true,
+        },
+    )
+    .await?;
+    // Cheap local crack phases over newly fetched hashes (no wordlist,
+    // no brute force — those stay manual). Keeps the cracks table moving
+    // with the scrape instead of frozen.
+    info!("refresh: cracking new hashes (cheap phases)");
+    crack::run(
+        db.clone(),
+        crack::Args {
+            phases: "multichoice,numeric,patterns".to_string(),
+            wordlist: None,
+            brute_len: 0,
+            export_hashes: None,
+            import_hashes: None,
+            salt: None,
         },
     )
     .await?;
