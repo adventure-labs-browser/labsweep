@@ -56,8 +56,29 @@ jobs:
         if: always()
         run: ./target/release/labsweep --db data/labsweep.db auth logout || true
 
-      - name: Publish database to rolling release
+      - name: Validate database before publish
         if: always()
+        id: dbcheck
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import sqlite3, os
+          ok = False
+          try:
+              assert os.path.getsize('data/labsweep.db') > 1_000_000
+              db = sqlite3.connect('file:data/labsweep.db?mode=ro', uri=True)
+              assert db.execute('PRAGMA page_count').fetchone()[0] > 0
+              tables = {r[0] for r in db.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'")}
+              assert {'queue', 'labs', 'adventures', 'stages',
+                      'reviews', 'meta'}.issubset(tables)
+              ok = True
+          except Exception as e:
+              print(f'validation failed: {e}')
+          print(f'valid={str(ok).lower()}')
+          PYEOF
+
+      - name: Publish database to rolling release
+        if: always() && steps.dbcheck.outputs.valid == 'true'
         run: |
           mkdir -p /tmp/dbparts
           zstd -T0 data/labsweep.db -o /tmp/dbparts/labsweep.db.zst
