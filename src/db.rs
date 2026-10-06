@@ -620,11 +620,43 @@ impl Db {
         .await
     }
 
+    /// Labs total + known-dead (tombstoned) count for the coverage
+    /// verify: `est_missing = api_total - (labs - dead)`.
+    pub async fn coverage_counts(&self) -> Result<(u64, u64)> {
+        self.run(|c| {
+            let labs: i64 =
+                c.query_row("SELECT COUNT(*) FROM labs", [], |r| r.get(0))?;
+            let dead: i64 = c.query_row(
+                "SELECT COUNT(*) FROM adventures \
+                 WHERE COALESCE(status,'active') = 'removed'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((labs as u64, dead as u64))
+        })
+        .await
+    }
+
     pub async fn labs_count(&self) -> Result<u64> {
         self.run(|c| {
             Ok(c.query_row("SELECT COUNT(*) FROM labs", [], |r| {
                 r.get::<_, i64>(0)
             })? as u64)
+        })
+        .await
+    }
+
+    /// Whether a guid is in the local discovery set.
+    pub async fn has_lab(&self, guid: &str) -> Result<bool> {
+        let guid = guid.to_string();
+        self.run(move |c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM labs WHERE guid = ?1",
+                params![guid],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
         })
         .await
     }

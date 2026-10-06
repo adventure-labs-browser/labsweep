@@ -19,6 +19,9 @@ pub struct Args {
 }
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
+    // Flow metric: labs discovered by THIS run = the measured miss count.
+    // (The stock metric — est_missing — comes from verify at the end.)
+    let labs_before = db.labs_count().await?;
     let n = db.requeue_done().await?;
     info!("refresh: {n} crawl cells re-queued");
     crawl::run(
@@ -89,6 +92,14 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         },
     )
     .await?;
-    info!("refresh: done — {}", db.stats().await?);
+    info!(
+        "refresh: done — {}",
+        db.stats().await?
+    );
+    let labs_after = db.labs_count().await?;
+    info!(
+        "refresh: +{} new labs this run ({labs_before} -> {labs_after})",
+        labs_after.saturating_sub(labs_before),
+    );
     Ok(())
 }
