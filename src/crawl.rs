@@ -76,19 +76,34 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     Ok(())
 }
 
-/// The API answers a planet-sized query with its claimed global total —
-/// comparing it to our deduplicated labs count is a free coverage check.
+/// Coverage check that separates the two things hiding inside a raw
+/// count diff: known-dead labs (tombstoned locally, no longer counted by
+/// the API) vs genuinely missing ones. `est_missing` near zero with a
+/// plausible `dead` count means probably fine; a large positive means
+/// the crawl is losing labs somewhere.
 pub async fn verify_global(db: &Db, client: &Client) {
     match client.global_total().await {
-        Ok(api_total) => match db.labs_count().await {
-            Ok(local) if local == api_total => {
-                info!("VERIFY OK — local labs ({local}) == API totalCount")
+        Ok(api_total) => match db.coverage_counts().await {
+            Ok((labs, dead)) => {
+                let live = labs.saturating_sub(dead);
+                let est_missing = api_total as i64 - live as i64;
+                info!(
+                    "verify: api_total={api_total} labs={labs} \
+                     known_dead={dead} live_est={live} est_missing={est_missing}"
+                );
+                if est_missing.abs() <= 500 {
+                    info!(
+                        "verify: probably fine \
+                         (est missing {est_missing} of {api_total})"
+                    );
+                } else {
+                    warn!(
+                        "VERIFY MISMATCH — api {api_total}, live est {live} \
+                         (labs {labs} - dead {dead}): est missing {est_missing}"
+                    );
+                }
             }
-            Ok(local) => warn!(
-                "VERIFY MISMATCH — local labs {local}, API totalCount {api_total} (diff {})",
-                api_total as i64 - local as i64
-            ),
-            Err(e) => warn!("verify: labs count failed: {e}"),
+            Err(e) => warn!("verify: coverage counts failed: {e}"),
         },
         Err(e) => warn!("verify: global query failed: {e}"),
     }

@@ -1,0 +1,47 @@
+name: audit
+on:
+  workflow_dispatch:
+    inputs:
+      lat:
+        description: "Parent cell latitude"
+        default: "41.011654"
+      lon:
+        description: "Parent cell longitude"
+        default: "-81.698474"
+      radius:
+        description: "Parent cell radius in meters"
+        default: "750000"
+
+permissions:
+  contents: read
+
+jobs:
+  audit-cell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      - name: Restore database from rolling release
+        run: |
+          mkdir -p data
+          gh release download db-latest -p 'labsweep.db.zst.part-*' --clobber
+          cat labsweep.db.zst.part-* | zstd -dc -o data/labsweep.db
+          rm -f labsweep.db.zst.part-*
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Coverage audit (read-only, no publish)
+        run: ./target/release/labsweep --db data/labsweep.db audit --lat "${{ inputs.lat }}" --lon "${{ inputs.lon }}" --radius "${{ inputs.radius }}"

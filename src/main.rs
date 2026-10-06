@@ -1,4 +1,5 @@
 mod api;
+mod audit;
 mod auth;
 mod crack;
 mod crawl;
@@ -110,6 +111,17 @@ enum Cmd {
         /// Re-scrape at most N stalest review sets (0 = all).
         #[arg(long, default_value_t = 0)]
         reviews_max: usize,
+    },
+    /// Deep-truth coverage audit for one split cell: captures the parent
+    /// and its 4 children and reports parent-only guids missing locally.
+    /// Informational (a few missing = churn); run occasionally by hand.
+    Audit {
+        #[arg(long)]
+        lat: f64,
+        #[arg(long)]
+        lon: f64,
+        #[arg(long)]
+        radius: f64,
     },
     /// Stage 4: crack stage answer hashes — md5(publicGuid + normalized).
     /// Candidates are generated locally and checked against every stage
@@ -269,6 +281,9 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Export { out } => export::run(db, export::Args { out }).await,
+        Cmd::Audit { lat, lon, radius } => {
+            audit::run(db, audit::Args { lat, lon, radius }).await
+        }
         Cmd::Refresh {
             crawl_rate,
             fetch_rate,
