@@ -24,7 +24,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     crawl::run(
         db.clone(),
         crawl::Args {
-            concurrency: 8,
+            concurrency: 16,
             rate: args.crawl_rate,
             seeds: 16,
             seed_radius_m: 12_000_000.0,
@@ -39,7 +39,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     fetch::run(
         db.clone(),
         fetch::Args {
-            concurrency: 16,
+            concurrency: 32,
             rate: args.fetch_rate,
             bearer: String::new(),
             max: 0,
@@ -54,7 +54,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     fetch::run(
         db.clone(),
         fetch::Args {
-            concurrency: 16,
+            concurrency: 32,
             rate: args.fetch_rate,
             bearer: String::new(),
             max: args.fetch_max,
@@ -66,7 +66,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     reviews::run(
         db.clone(),
         reviews::Args {
-            concurrency: 16,
+            concurrency: 32,
             rate: args.reviews_rate,
             bearer: String::new(),
             max: 0,
@@ -81,7 +81,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     reviews::run(
         db.clone(),
         reviews::Args {
-            concurrency: 16,
+            concurrency: 32,
             rate: args.reviews_rate,
             bearer: String::new(),
             max: args.reviews_max,
