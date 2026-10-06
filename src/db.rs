@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS review_versions (
     review_id INTEGER NOT NULL,
     version_seq INTEGER NOT NULL,
     superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    change TEXT NOT NULL,              -- updated|removed|restored
+    change TEXT NOT NULL,              -- updated|removed|restored|moved
     raw_json TEXT,
     PRIMARY KEY (review_id, version_seq)
 );
@@ -1071,7 +1071,10 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
     /// Never-delete: changed reviews archive the old row, vanished ones
     /// are tombstoned (each processed adventure is a full listing, so
     /// absence is conclusive), reappeared ones restore. Unchanged rows
-    /// are not touched at all.
+    /// are not touched at all. Review ids are matched globally, not per
+    /// adventure — the same id can surface under another adventure (or
+    /// twice in one listing), and those become versioned moves, never
+    /// UNIQUE failures.
     pub async fn save_reviews(
         &self,
         guid: String,
@@ -1087,21 +1090,42 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             tx.execute("CREATE TEMP TABLE IF NOT EXISTS seen_ids(id INTEGER PRIMARY KEY)", [])?;
             tx.execute("DELETE FROM seen_ids", [])?;
             {
-                let mut known: std::collections::HashMap<i64, (String, Option<String>)> =
-                    std::collections::HashMap::new();
+                // Review ids are not unique per adventure (and the API can
+                // repeat an id across pages), so stage the whole batch and
+                // match rows globally — a per-adventure lookup followed by
+                // a plain INSERT is what blew up with UNIQUE violations,
+                // poisoning the adventure (checked_at never advances, so it
+                // would retry and fail forever).
+                let mut processed: std::collections::HashSet<i64> =
+                    std::collections::HashSet::new();
+                let mut seen_ins =
+                    tx.prepare("INSERT OR IGNORE INTO seen_ids(id) VALUES (?1)")?;
+                for r in &items {
+                    if let Some(id) = i(r, "id") {
+                        if processed.insert(id) {
+                            seen_ins.execute(params![id])?;
+                        }
+                    }
+                }
+                drop(seen_ins);
+                let mut known: std::collections::HashMap<
+                    i64,
+                    (String, String, Option<String>),
+                > = std::collections::HashMap::new();
                 let mut stmt = tx.prepare(
-                    "SELECT id, COALESCE(status,'active'), content_hash FROM reviews \
-                     WHERE adventure_guid=?1",
+                    "SELECT id, adventure_guid, COALESCE(status,'active'), content_hash \
+                     FROM reviews WHERE id IN (SELECT id FROM seen_ids)",
                 )?;
-                for row in stmt.query_map(params![guid], |r| {
+                for row in stmt.query_map([], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
                     ))
                 })? {
-                    let (id, st, h) = row?;
-                    known.insert(id, (st, h));
+                    let (id, g, st, h) = row?;
+                    known.insert(id, (g, st, h));
                 }
                 let mut ins = tx.prepare(
                     "INSERT INTO reviews (id, adventure_guid, rating, \
@@ -1113,16 +1137,17 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15, \
                        'active',?16,1)",
                 )?;
-                let mut seen_ins =
-                    tx.prepare("INSERT OR IGNORE INTO seen_ids(id) VALUES (?1)")?;
                 for r in &items {
                     let Some(id) = i(r, "id") else { continue };
-                    seen_ins.execute(params![id])?;
+                    if !processed.remove(&id) {
+                        continue; // within-batch duplicate: keep first
+                    }
                     let images = r.get("images").cloned().unwrap_or(Value::Null);
                     let tags = r.get("playerTags").cloned().unwrap_or(Value::Null);
                     let raw = serde_json::to_string(r)?;
                     let hash = content_hash(&raw);
                     match known.remove(&id) {
+                        // No row with this id anywhere: safe plain INSERT.
                         None => {
                             ins.execute(params![
                                 id,
@@ -1144,17 +1169,24 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
                             ])?;
                             written += 1;
                         }
-                        Some((st, Some(h))) if st == "active" && h == hash => {}
-                        Some((st, prev_hash)) => {
+                        // Same adventure, unchanged: untouched.
+                        Some((g2, st, Some(h)))
+                            if g2 == guid && st == "active" && h == hash => {}
+                        Some((g2, st, prev_hash)) => {
                             let changed =
                                 matches!(&prev_hash, Some(h) if *h != hash);
+                            let moved = g2 != guid;
+                            // Archive on real content change of a live row.
+                            // Pure re-association (same content, other
+                            // adventure) and restores need no archive — the
+                            // prior snapshot is already history.
                             if changed && st == "active" {
                                 tx.execute(
                                     "INSERT INTO review_versions \
                                        (review_id, version_seq, change, raw_json) \
-                                     SELECT id, COALESCE(version_seq,1), 'updated', raw_json \
+                                     SELECT id, COALESCE(version_seq,1), ?2, raw_json \
                                      FROM reviews WHERE id=?1",
-                                    params![id],
+                                    params![id, if moved { "moved" } else { "updated" }],
                                 )?;
                             }
                             tx.execute(
