@@ -192,9 +192,12 @@ async fn process_cell(
         info!("[{cid}] RESUME at skip={skip} total={total}");
     }
 
-    // Paginate. Normal mode stops once we have all reported items;
+    // Paginate. Normal mode stops once we have all reported items (every
+    // total <= PAGINATION_LIMIT is fully reachable: the last page is
+    // skip=9500+take=500, whose window ends exactly at the 10000 limit);
     // min-radius mode (total > limit, can't subdivide) keeps going until
-    // a short page or the skip cliff — best-effort capture.
+    // a short page — pages past the 10000 window fail with HTTP 500 and
+    // land in mark_failed, so best-effort capture ends at ~9500+ items.
     let normal = total <= PAGINATION_LIMIT;
     while skip <= MAX_SKIP && (!normal || (skip as u64) < total) {
         if stop.load(Ordering::SeqCst) {

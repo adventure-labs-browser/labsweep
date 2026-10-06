@@ -27,7 +27,11 @@ pub const USER_AGENT: &str = "Adventures/1.71.0 (5197) (android/36)";
 
 /// Server hard cap on `Take`.
 pub const TAKE: usize = 500;
-/// Empirical cliff: `Skip` past ~9500 returns 0 items + totalCount=None.
+/// Pagination limit: the API allows any window with `Skip + Take <= 10000`
+/// and answers windows past that with HTTP 500 (verified live 2026-10-06:
+/// skip=9500+take=500 returns the tail; skip=9600+take=500 errors).
+/// Cells are therefore fully paginable up to totalCount 10000, and anything
+/// above must subdivide — which is exactly what PAGINATION_LIMIT enforces.
 pub const MAX_SKIP: usize = 9500;
 /// A cell with totalCount above this cannot be fully paginated.
 pub const PAGINATION_LIMIT: u64 = 10_000;
