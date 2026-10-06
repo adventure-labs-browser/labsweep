@@ -1475,6 +1475,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
     }
 
     /// Cracks for one 2-hex-char guid prefix.
+    #[allow(clippy::type_complexity)]
     pub async fn cracks_prefix(
         &self,
         prefix: String,

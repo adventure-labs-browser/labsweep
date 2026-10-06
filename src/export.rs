@@ -187,7 +187,7 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         let path = args.out.join("detail").join(format!("{prefix}.json.gz"));
         shard_bytes += gz_write(&path, &Value::Object(shard))?;
         n_shards += 1;
-        if n_shards % 32 == 0 {
+        if n_shards.is_multiple_of(32) {
             info!("detail: {} shards written", n_shards);
         }
     }
