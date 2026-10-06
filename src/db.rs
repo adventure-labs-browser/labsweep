@@ -677,7 +677,7 @@ impl Db {
                 // First good sighting: plain insert. This snapshot IS v1,
                 // so no version row.
                 (None, Some(d)) => {
-                    insert_adventure(&tx, &guid, &d, status)?;
+                    Self::insert_adventure(&tx, &guid, &d, status)?;
                 }
                 (Some((_, prev_http, prev_status)), None) => {
                     let was_good = prev_http == Some(200);
@@ -685,7 +685,7 @@ impl Db {
                     if status == 404 && was_good && active {
                         // Tombstone: archive last-good, mark removed, keep
                         // the data. A later 200 restores it (see below).
-                        archive_adventure(&tx, &guid, "removed")?;
+                        Self::archive_adventure(&tx, &guid, "removed")?;
                         tx.execute(
                             "UPDATE adventures SET status='removed', \
                              removed_at=CURRENT_TIMESTAMP, http_status=404, error=?2, \
@@ -695,7 +695,7 @@ impl Db {
                         )?;
                         // Stages belong to the listing: tombstone them too.
                         // Reviews are standalone records; they stay.
-                        tombstone_stages(&tx, &guid)?;
+                        Self::tombstone_stages(&tx, &guid)?;
                     } else {
                         // Transient failure (429/5xx/exhausted retries) or
                         // a row that never had good data: record the error,
@@ -721,7 +721,7 @@ impl Db {
                             &guid,
                             if restored { "restored" } else { "updated" },
                         )?;
-                        update_adventure(&tx, &guid, &d, status, &hash)?;
+                        Self::update_adventure(&tx, &guid, &d, status, &hash)?;
                     } else {
                         // Same content, still active: light touch.
                         tx.execute(
@@ -731,7 +731,7 @@ impl Db {
                             params![guid, status as i64, hash],
                         )?;
                     }
-                    reconcile_stages(&tx, &guid, &d)?;
+                    Self::reconcile_stages(&tx, &guid, &d)?;
                 }
             }
             tx.commit()?;
@@ -806,7 +806,7 @@ fn insert_adventure(tx: &Transaction, guid: &str, d: &Value, status: u16) -> Res
             hash,
         ],
     )?;
-    reconcile_stages(tx, guid, d)?;
+    Self::reconcile_stages(tx, guid, d)?;
     Ok(())
 }
 
@@ -876,7 +876,6 @@ fn reconcile_stages(tx: &Transaction, guid: &str, d: &Value) -> Result<()> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    {
         // (status, content_hash) for every known stage, active or not, so
         // reappearing stages restore instead of conflicting on INSERT.
         let mut live: std::collections::HashMap<i64, (String, Option<String>)> =
@@ -967,9 +966,7 @@ fn reconcile_stages(tx: &Transaction, guid: &str, d: &Value) -> Result<()> {
                 }
             }
         }
-    }
     // Anything left in `live` vanished from the listing: tombstone it.
-    // (`ins` is dead after the loop above, so this may borrow `tx` again.)
     drop(ins);
     for idx in live.into_keys() {
         tx.execute(
@@ -1557,10 +1554,12 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
 
 // ── JSON extraction helpers ─────────────────────────────────────────────
 
+use md5::{Digest, Md5};
+
 /// Content hash for change detection (never-delete versioning). md5 is
 /// fine here — this is a fingerprint, not security.
 fn content_hash(raw: &str) -> String {
-    format!("{:x}", md5::compute(raw.as_bytes()))
+    format!("{:x}", Md5::digest(raw.as_bytes()))
 }
 
 fn s(v: &Value, k: &str) -> Option<String> {
