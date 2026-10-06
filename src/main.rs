@@ -6,6 +6,7 @@ mod db;
 mod export;
 mod fetch;
 mod geo;
+mod refresh;
 mod reviews;
 mod util;
 
@@ -68,6 +69,9 @@ enum Cmd {
         /// Fetch at most N GUIDs (0 = all pending).
         #[arg(long, default_value_t = 0)]
         max: usize,
+        /// Refresh mode: re-fetch already-fetched details stalest-first.
+        #[arg(long, default_value_t = false)]
+        restudy: bool,
     },
     /// Stage 3: fetch all reviews for adventures that have them.
     Reviews {
@@ -83,6 +87,29 @@ enum Cmd {
         /// Process at most N adventures (0 = all pending).
         #[arg(long, default_value_t = 0)]
         max: usize,
+        /// Refresh mode: re-scrape already-scraped adventures stalest-first.
+        #[arg(long, default_value_t = false)]
+        revisit: bool,
+    },
+    /// Refresh pass: re-queue crawl cells, pick up new labs, re-fetch
+    /// stalest details, re-scrape stalest reviews. Never deletes —
+    /// updates, removals and restores append to version history.
+    Refresh {
+        /// Max aggregate crawl requests/sec.
+        #[arg(long, default_value_t = 10.0)]
+        crawl_rate: f64,
+        /// Max aggregate fetch requests/sec.
+        #[arg(long, default_value_t = 12.0)]
+        fetch_rate: f64,
+        /// Max aggregate reviews requests/sec.
+        #[arg(long, default_value_t = 12.0)]
+        reviews_rate: f64,
+        /// Re-fetch at most N stalest details (0 = all).
+        #[arg(long, default_value_t = 0)]
+        fetch_max: usize,
+        /// Re-scrape at most N stalest review sets (0 = all).
+        #[arg(long, default_value_t = 0)]
+        reviews_max: usize,
     },
     /// Stage 4: crack stage answer hashes — md5(publicGuid + normalized).
     /// Candidates are generated locally and checked against every stage
@@ -187,6 +214,7 @@ async fn main() -> Result<()> {
             rate,
             bearer,
             max,
+            restudy,
         } => {
             fetch::run(
                 db,
@@ -195,6 +223,7 @@ async fn main() -> Result<()> {
                     rate,
                     bearer,
                     max,
+                    restudy,
                 },
             )
             .await
@@ -204,6 +233,7 @@ async fn main() -> Result<()> {
             rate,
             bearer,
             max,
+            revisit,
         } => {
             reviews::run(
                 db,
@@ -212,6 +242,7 @@ async fn main() -> Result<()> {
                     rate,
                     bearer,
                     max,
+                    revisit,
                 },
             )
             .await
@@ -238,6 +269,25 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Export { out } => export::run(db, export::Args { out }).await,
+        Cmd::Refresh {
+            crawl_rate,
+            fetch_rate,
+            reviews_rate,
+            fetch_max,
+            reviews_max,
+        } => {
+            refresh::run(
+                db,
+                refresh::Args {
+                    crawl_rate,
+                    fetch_rate,
+                    reviews_rate,
+                    fetch_max,
+                    reviews_max,
+                },
+            )
+            .await
+        }
         Cmd::Stats => {
             println!("{}", db.stats().await?);
             Ok(())

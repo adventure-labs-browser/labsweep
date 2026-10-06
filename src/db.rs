@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use tokio::task::spawn_blocking;
 
@@ -72,9 +72,17 @@ CREATE TABLE IF NOT EXISTS adventures (
     raw_json TEXT NOT NULL,
     http_status INTEGER,
     error TEXT,
-    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Never-delete history (refresh mode): removals are marks, updates
+    -- append to adventure_versions. NULL status on old rows == 'active'.
+    status TEXT NOT NULL DEFAULT 'active',   -- active|removed|unfetched
+    content_hash TEXT,                        -- md5(raw_json); NULL = pre-history baseline
+    removed_at TEXT,
+    version_seq INTEGER NOT NULL DEFAULT 1,
+    reviews_checked_at TEXT                   -- last full reviews re-scrape
 );
 CREATE INDEX IF NOT EXISTS idx_adv_pub ON adventures(published_utc);
+CREATE INDEX IF NOT EXISTS idx_adv_status ON adventures(status);
 
 -- stages.raw_json keeps the full API stage object, including the answer
 -- hash fields (only present when fetched with a bearer token):
@@ -118,6 +126,10 @@ CREATE TABLE IF NOT EXISTS stages (
     longitude REAL,
     question TEXT,
     raw_json TEXT,
+    status TEXT NOT NULL DEFAULT 'active',   -- active|removed
+    content_hash TEXT,                        -- md5(raw_json); NULL = pre-history baseline
+    removed_at TEXT,
+    version_seq INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (adventure_guid, stage_index)
 );
 
@@ -137,9 +149,46 @@ CREATE TABLE IF NOT EXISTS reviews (
     images_json TEXT,
     tags_json TEXT,
     raw_json TEXT NOT NULL,
-    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active',   -- active|removed
+    content_hash TEXT,                        -- md5(raw_json); NULL = pre-history baseline
+    removed_at TEXT,
+    version_seq INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_adv ON reviews(adventure_guid);
+CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+
+-- Never-delete version history. Each row is a snapshot of a live row as
+-- it was when superseded (updated), tombstoned (removed/deleted) or
+-- seen again after removal (restored). Parsed columns are re-derivable
+-- from raw_json, so versions stay lean. Live tables always hold latest.
+CREATE TABLE IF NOT EXISTS adventure_versions (
+    adventure_guid TEXT NOT NULL,
+    version_seq INTEGER NOT NULL,
+    superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    change TEXT NOT NULL,              -- updated|removed|restored
+    status TEXT,
+    http_status INTEGER,
+    raw_json TEXT,
+    PRIMARY KEY (adventure_guid, version_seq)
+);
+CREATE TABLE IF NOT EXISTS stage_versions (
+    adventure_guid TEXT NOT NULL,
+    stage_index INTEGER NOT NULL,
+    version_seq INTEGER NOT NULL,
+    superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    change TEXT NOT NULL,              -- updated|deleted|removed|restored
+    raw_json TEXT,
+    PRIMARY KEY (adventure_guid, stage_index, version_seq)
+);
+CREATE TABLE IF NOT EXISTS review_versions (
+    review_id INTEGER NOT NULL,
+    version_seq INTEGER NOT NULL,
+    superseded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    change TEXT NOT NULL,              -- updated|removed|restored
+    raw_json TEXT,
+    PRIMARY KEY (review_id, version_seq)
+);
 
 -- Cracked answers: one row per (stage, accepted-hash) we recovered.
 -- plaintext is the normalized candidate that hashed; display keeps the
@@ -275,6 +324,22 @@ impl Db {
         ensure_column(&conn, "queue", "next_skip", "next_skip INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "adventures", "reviews_done", "reviews_done INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "adventures", "reviews_error", "reviews_error TEXT")?;
+        // Never-delete history columns. Deliberately nullable with no
+        // default: SQLite then skips the table rewrite, so migrating the
+        // 25G database is instant. NULL status reads as 'active'.
+        ensure_column(&conn, "adventures", "status", "status TEXT")?;
+        ensure_column(&conn, "adventures", "content_hash", "content_hash TEXT")?;
+        ensure_column(&conn, "adventures", "removed_at", "removed_at TEXT")?;
+        ensure_column(&conn, "adventures", "version_seq", "version_seq INTEGER")?;
+        ensure_column(&conn, "adventures", "reviews_checked_at", "reviews_checked_at TEXT")?;
+        ensure_column(&conn, "stages", "status", "status TEXT")?;
+        ensure_column(&conn, "stages", "content_hash", "content_hash TEXT")?;
+        ensure_column(&conn, "stages", "removed_at", "removed_at TEXT")?;
+        ensure_column(&conn, "stages", "version_seq", "version_seq INTEGER")?;
+        ensure_column(&conn, "reviews", "status", "status TEXT")?;
+        ensure_column(&conn, "reviews", "content_hash", "content_hash TEXT")?;
+        ensure_column(&conn, "reviews", "removed_at", "removed_at TEXT")?;
+        ensure_column(&conn, "reviews", "version_seq", "version_seq INTEGER")?;
         Ok(Self { inner: Arc::new(Mutex::new(conn)) })
     }
 
@@ -591,112 +656,82 @@ impl Db {
     ) -> Result<()> {
         self.run(move |c| {
             let tx = c.transaction()?;
-            match detail {
-                None => {
+            // Current live state, if any.
+            let live: Option<(Option<String>, Option<i64>, Option<String>)> = tx
+                .query_row(
+                    "SELECT content_hash, http_status, status FROM adventures WHERE guid=?1",
+                    params![guid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match (live, detail) {
+                // First sighting and it errored: record an unfetched stub.
+                // Never tombstones — there is no last-good state to lose.
+                (None, None) => {
                     tx.execute(
-                        "INSERT INTO adventures (guid, raw_json, http_status, error) \
-                         VALUES (?1, '{}', ?2, ?3) \
-                         ON CONFLICT(guid) DO UPDATE SET raw_json=excluded.raw_json, \
-                           http_status=excluded.http_status, error=excluded.error, \
-                           fetched_at=CURRENT_TIMESTAMP",
+                        "INSERT INTO adventures (guid, raw_json, http_status, error, status) \
+                         VALUES (?1, '{}', ?2, ?3, 'unfetched')",
                         params![guid, status as i64, error],
                     )?;
                 }
-                Some(d) => {
-                    let (lat, lon) = loc(&d);
-                    let themes = d.get("adventureThemes").cloned().unwrap_or(Value::Null);
-                    tx.execute(
-                        "INSERT INTO adventures (guid, title, description, adventure_type, \
-                           median_time_to_complete, ratings_average, ratings_total_count, \
-                           reviews_total_count, completion_count, recommended_count, \
-                           journals_total_count, completed_stages_count, stages_total_count, \
-                           owner_username, owner_public_guid, is_archived, is_test, \
-                           is_highly_recommended, visibility, published_utc, created_utc, \
-                           location_lat, location_lon, custom_access_code, themes_json, \
-                           raw_json, http_status, error) \
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28) \
-                         ON CONFLICT(guid) DO UPDATE SET \
-                           title=excluded.title, description=excluded.description, \
-                           adventure_type=excluded.adventure_type, \
-                           median_time_to_complete=excluded.median_time_to_complete, \
-                           ratings_average=excluded.ratings_average, \
-                           ratings_total_count=excluded.ratings_total_count, \
-                           reviews_total_count=excluded.reviews_total_count, \
-                           completion_count=excluded.completion_count, \
-                           recommended_count=excluded.recommended_count, \
-                           journals_total_count=excluded.journals_total_count, \
-                           completed_stages_count=excluded.completed_stages_count, \
-                           stages_total_count=excluded.stages_total_count, \
-                           owner_username=excluded.owner_username, \
-                           owner_public_guid=excluded.owner_public_guid, \
-                           is_archived=excluded.is_archived, is_test=excluded.is_test, \
-                           is_highly_recommended=excluded.is_highly_recommended, \
-                           visibility=excluded.visibility, \
-                           published_utc=excluded.published_utc, \
-                           created_utc=excluded.created_utc, \
-                           location_lat=excluded.location_lat, \
-                           location_lon=excluded.location_lon, \
-                           custom_access_code=excluded.custom_access_code, \
-                           themes_json=excluded.themes_json, raw_json=excluded.raw_json, \
-                           http_status=excluded.http_status, error=excluded.error, \
-                           fetched_at=CURRENT_TIMESTAMP",
-                        params![
-                            guid,
-                            s(&d, "title"),
-                            s(&d, "description"),
-                            s(&d, "adventureType"),
-                            i(&d, "medianTimeToComplete"),
-                            f(&d, "ratingsAverage"),
-                            i(&d, "ratingsTotalCount"),
-                            i(&d, "reviewsTotalCount"),
-                            i(&d, "completionCount"),
-                            i(&d, "recommendedCount"),
-                            i(&d, "journalsTotalCount"),
-                            i(&d, "completedStagesCount"),
-                            i(&d, "stagesTotalCount"),
-                            s(&d, "ownerUsername"),
-                            s(&d, "ownerPublicGuid"),
-                            b(&d, "isArchived"),
-                            b(&d, "isTest"),
-                            b(&d, "isHighlyRecommended"),
-                            s(&d, "visibility"),
-                            s(&d, "publishedUtc"),
-                            s(&d, "createdUtc"),
-                            lat,
-                            lon,
-                            s(&d, "customAccessCode"),
-                            serde_json::to_string(&themes)?,
-                            serde_json::to_string(&d)?,
-                            status as i64,
-                            Option::<String>::None,
-                        ],
-                    )?;
-                    tx.execute("DELETE FROM stages WHERE adventure_guid=?1", params![guid])?;
-                    if let Some(stages) = d.get("stageSummaries").and_then(|v| v.as_array()) {
-                        let mut stmt = tx.prepare(
-                            "INSERT INTO stages (adventure_guid, stage_index, title, \
-                               description, challenge_type, is_complete, is_final, \
-                               geofencing_radius, latitude, longitude, question, raw_json) \
-                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                // First good sighting: plain insert. This snapshot IS v1,
+                // so no version row.
+                (None, Some(d)) => {
+                    insert_adventure(&tx, &guid, &d, status)?;
+                }
+                (Some((_, prev_http, prev_status)), None) => {
+                    let was_good = prev_http == Some(200);
+                    let active = prev_status.as_deref().unwrap_or("active") == "active";
+                    if status == 404 && was_good && active {
+                        // Tombstone: archive last-good, mark removed, keep
+                        // the data. A later 200 restores it (see below).
+                        archive_adventure(&tx, &guid, "removed")?;
+                        tx.execute(
+                            "UPDATE adventures SET status='removed', \
+                             removed_at=CURRENT_TIMESTAMP, http_status=404, error=?2, \
+                             fetched_at=CURRENT_TIMESTAMP, \
+                             version_seq=COALESCE(version_seq,1)+1 WHERE guid=?1",
+                            params![guid, error],
                         )?;
-                        for (idx, stage) in stages.iter().enumerate() {
-                            let (slat, slon) = loc(stage);
-                            stmt.execute(params![
-                                guid,
-                                idx as i64,
-                                s(stage, "title"),
-                                s(stage, "description"),
-                                s(stage, "challengeType"),
-                                b(stage, "isComplete"),
-                                b(stage, "isFinal"),
-                                i(stage, "geofencingRadius"),
-                                slat,
-                                slon,
-                                s(stage, "question"),
-                                serde_json::to_string(stage)?,
-                            ])?;
-                        }
+                        // Stages belong to the listing: tombstone them too.
+                        // Reviews are standalone records; they stay.
+                        tombstone_stages(&tx, &guid)?;
+                    } else {
+                        // Transient failure (429/5xx/exhausted retries) or
+                        // a row that never had good data: record the error,
+                        // preserve everything else, no version row.
+                        tx.execute(
+                            "UPDATE adventures SET http_status=?2, error=?3, \
+                             fetched_at=CURRENT_TIMESTAMP WHERE guid=?1",
+                            params![guid, status as i64, error],
+                        )?;
                     }
+                }
+                (Some((prev_hash, _, prev_status)), Some(d)) => {
+                    let raw = serde_json::to_string(&d)?;
+                    let hash = content_hash(&raw);
+                    let restored = prev_status.as_deref().unwrap_or("active") == "removed";
+                    // NULL hash = pre-history row: adopt as baseline with
+                    // no archive, else the first refresh would double the DB.
+                    let changed =
+                        matches!(&prev_hash, Some(h) if *h != hash);
+                    if restored || changed {
+                        archive_adventure(
+                            &tx,
+                            &guid,
+                            if restored { "restored" } else { "updated" },
+                        )?;
+                        update_adventure(&tx, &guid, &d, status, &hash)?;
+                    } else {
+                        // Same content, still active: light touch.
+                        tx.execute(
+                            "UPDATE adventures SET http_status=?2, error=NULL, \
+                             fetched_at=CURRENT_TIMESTAMP, content_hash=?3 \
+                             WHERE guid=?1",
+                            params![guid, status as i64, hash],
+                        )?;
+                    }
+                    reconcile_stages(&tx, &guid, &d)?;
                 }
             }
             tx.commit()?;
@@ -706,6 +741,273 @@ impl Db {
     }
 
     // ── reviews stage ───────────────────────────────────────────────────
+
+// ── never-delete versioning helpers ─────────────────────────────────────
+// Live tables always hold the latest snapshot; these archive the
+// superseded row into the matching *_versions table first.
+
+/// Snapshot the current live adventure row. Caller then updates live.
+fn archive_adventure(tx: &Transaction, guid: &str, change: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO adventure_versions \
+           (adventure_guid, version_seq, change, status, http_status, raw_json) \
+         SELECT ?1, COALESCE(version_seq,1), ?2, \
+           COALESCE(status,'active'), http_status, raw_json \
+         FROM adventures WHERE guid=?1",
+        params![guid, change],
+    )?;
+    Ok(())
+}
+
+/// Fresh insert of a first-seen adventure (v1, no version row).
+fn insert_adventure(tx: &Transaction, guid: &str, d: &Value, status: u16) -> Result<()> {
+    let (lat, lon) = loc(d);
+    let themes = d.get("adventureThemes").cloned().unwrap_or(Value::Null);
+    let raw = serde_json::to_string(d)?;
+    let hash = content_hash(&raw);
+    tx.execute(
+        "INSERT INTO adventures (guid, title, description, adventure_type, \
+           median_time_to_complete, ratings_average, ratings_total_count, \
+           reviews_total_count, completion_count, recommended_count, \
+           journals_total_count, completed_stages_count, stages_total_count, \
+           owner_username, owner_public_guid, is_archived, is_test, \
+           is_highly_recommended, visibility, published_utc, created_utc, \
+           location_lat, location_lon, custom_access_code, themes_json, \
+           raw_json, http_status, error, status, content_hash, version_seq) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,NULL,'active',?28,1)",
+        params![
+            guid,
+            s(d, "title"),
+            s(d, "description"),
+            s(d, "adventureType"),
+            i(d, "medianTimeToComplete"),
+            f(d, "ratingsAverage"),
+            i(d, "ratingsTotalCount"),
+            i(d, "reviewsTotalCount"),
+            i(d, "completionCount"),
+            i(d, "recommendedCount"),
+            i(d, "journalsTotalCount"),
+            i(d, "completedStagesCount"),
+            i(d, "stagesTotalCount"),
+            s(d, "ownerUsername"),
+            s(d, "ownerPublicGuid"),
+            b(d, "isArchived"),
+            b(d, "isTest"),
+            b(d, "isHighlyRecommended"),
+            s(d, "visibility"),
+            s(d, "publishedUtc"),
+            s(d, "createdUtc"),
+            lat,
+            lon,
+            s(d, "customAccessCode"),
+            serde_json::to_string(&themes)?,
+            raw,
+            status as i64,
+            hash,
+        ],
+    )?;
+    reconcile_stages(tx, guid, d)?;
+    Ok(())
+}
+
+/// Overwrite live with new content after archiving. Resets tombstones.
+fn update_adventure(
+    tx: &Transaction,
+    guid: &str,
+    d: &Value,
+    status: u16,
+    hash: &str,
+) -> Result<()> {
+    let (lat, lon) = loc(d);
+    let themes = d.get("adventureThemes").cloned().unwrap_or(Value::Null);
+    let raw = serde_json::to_string(d)?;
+    tx.execute(
+        "UPDATE adventures SET title=?2, description=?3, adventure_type=?4, \
+           median_time_to_complete=?5, ratings_average=?6, ratings_total_count=?7, \
+           reviews_total_count=?8, completion_count=?9, recommended_count=?10, \
+           journals_total_count=?11, completed_stages_count=?12, \
+           stages_total_count=?13, owner_username=?14, owner_public_guid=?15, \
+           is_archived=?16, is_test=?17, is_highly_recommended=?18, \
+           visibility=?19, published_utc=?20, created_utc=?21, \
+           location_lat=?22, location_lon=?23, custom_access_code=?24, \
+           themes_json=?25, raw_json=?26, http_status=?27, error=NULL, \
+           status='active', removed_at=NULL, content_hash=?28, \
+           fetched_at=CURRENT_TIMESTAMP, version_seq=COALESCE(version_seq,1)+1 \
+         WHERE guid=?1",
+        params![
+            guid,
+            s(d, "title"),
+            s(d, "description"),
+            s(d, "adventureType"),
+            i(d, "medianTimeToComplete"),
+            f(d, "ratingsAverage"),
+            i(d, "ratingsTotalCount"),
+            i(d, "reviewsTotalCount"),
+            i(d, "completionCount"),
+            i(d, "recommendedCount"),
+            i(d, "journalsTotalCount"),
+            i(d, "completedStagesCount"),
+            i(d, "stagesTotalCount"),
+            s(d, "ownerUsername"),
+            s(d, "ownerPublicGuid"),
+            b(d, "isArchived"),
+            b(d, "isTest"),
+            b(d, "isHighlyRecommended"),
+            s(d, "visibility"),
+            s(d, "publishedUtc"),
+            s(d, "createdUtc"),
+            lat,
+            lon,
+            s(d, "customAccessCode"),
+            serde_json::to_string(&themes)?,
+            raw,
+            status as i64,
+            hash,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Reconcile live stages against a fresh detail listing: insert new,
+/// version-and-update changed, tombstone vanished. Never hard-deletes.
+fn reconcile_stages(tx: &Transaction, guid: &str, d: &Value) -> Result<()> {
+    let stages = d
+        .get("stageSummaries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    {
+        // (status, content_hash) for every known stage, active or not, so
+        // reappearing stages restore instead of conflicting on INSERT.
+        let mut live: std::collections::HashMap<i64, (String, Option<String>)> =
+            std::collections::HashMap::new();
+        let mut stmt = tx.prepare(
+            "SELECT stage_index, COALESCE(status,'active'), content_hash FROM stages \
+             WHERE adventure_guid=?1",
+        )?;
+        for row in stmt.query_map(params![guid], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })? {
+            let (idx, st, h) = row?;
+            live.insert(idx, (st, h));
+        }
+        let mut ins = tx.prepare(
+            "INSERT INTO stages (adventure_guid, stage_index, title, \
+               description, challenge_type, is_complete, is_final, \
+               geofencing_radius, latitude, longitude, question, raw_json, \
+               status, content_hash, version_seq) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'active',?13,1)",
+        )?;
+        for (idx, stage) in stages.iter().enumerate() {
+            let idx = idx as i64;
+            let raw = serde_json::to_string(stage)?;
+            let hash = content_hash(&raw);
+            match live.remove(&idx) {
+                // Brand new stage.
+                None => {
+                    let (slat, slon) = loc(stage);
+                    ins.execute(params![
+                        guid,
+                        idx,
+                        s(stage, "title"),
+                        s(stage, "description"),
+                        s(stage, "challengeType"),
+                        b(stage, "isComplete"),
+                        b(stage, "isFinal"),
+                        i(stage, "geofencingRadius"),
+                        slat,
+                        slon,
+                        s(stage, "question"),
+                        raw,
+                        hash,
+                    ])?;
+                }
+                // Unchanged active stage: leave it alone entirely.
+                Some((st, Some(h))) if st == "active" && h == hash => {}
+                // Known stage: archive on real change (not on baseline
+                // adoption, not on restore — that snapshot is already in
+                // versions from tombstone time), then overwrite live.
+                Some((st, prev_hash)) => {
+                    let changed = matches!(&prev_hash, Some(h) if *h != hash);
+                    if changed && st == "active" {
+                        tx.execute(
+                            "INSERT INTO stage_versions \
+                               (adventure_guid, stage_index, version_seq, change, raw_json) \
+                             SELECT adventure_guid, stage_index, \
+                               COALESCE(version_seq,1), 'updated', raw_json \
+                             FROM stages WHERE adventure_guid=?1 AND stage_index=?2",
+                            params![guid, idx],
+                        )?;
+                    }
+                    let (slat, slon) = loc(stage);
+                    tx.execute(
+                        "UPDATE stages SET title=?3, description=?4, \
+                         challenge_type=?5, is_complete=?6, is_final=?7, \
+                         geofencing_radius=?8, latitude=?9, longitude=?10, \
+                         question=?11, raw_json=?12, content_hash=?13, \
+                         status='active', removed_at=NULL, \
+                         version_seq=COALESCE(version_seq,1)+1 WHERE \
+                         adventure_guid=?1 AND stage_index=?2",
+                        params![
+                            guid,
+                            idx,
+                            s(stage, "title"),
+                            s(stage, "description"),
+                            s(stage, "challengeType"),
+                            b(stage, "isComplete"),
+                            b(stage, "isFinal"),
+                            i(stage, "geofencingRadius"),
+                            slat,
+                            slon,
+                            s(stage, "question"),
+                            raw,
+                            hash,
+                        ],
+                    )?;
+                }
+            }
+        }
+    }
+    // Anything left in `live` vanished from the listing: tombstone it.
+    // (`ins` is dead after the loop above, so this may borrow `tx` again.)
+    drop(ins);
+    for idx in live.into_keys() {
+        tx.execute(
+            "INSERT INTO stage_versions \
+               (adventure_guid, stage_index, version_seq, change, raw_json) \
+             SELECT adventure_guid, stage_index, COALESCE(version_seq,1), \
+               'deleted', raw_json \
+             FROM stages WHERE adventure_guid=?1 AND stage_index=?2",
+            params![guid, idx],
+        )?;
+        tx.execute(
+            "UPDATE stages SET status='removed', removed_at=CURRENT_TIMESTAMP, \
+             version_seq=COALESCE(version_seq,1)+1 \
+             WHERE adventure_guid=?1 AND stage_index=?2",
+            params![guid, idx],
+        )?;
+    }
+    Ok(())
+}
+
+/// Tombstone every active stage of an adventure (parent got 404).
+fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO stage_versions \
+           (adventure_guid, stage_index, version_seq, change, raw_json) \
+         SELECT adventure_guid, stage_index, COALESCE(version_seq,1), \
+           'removed', raw_json FROM stages \
+         WHERE adventure_guid=?1 AND COALESCE(status,'active')='active'",
+        params![guid],
+    )?;
+    tx.execute(
+        "UPDATE stages SET status='removed', removed_at=CURRENT_TIMESTAMP, \
+         version_seq=COALESCE(version_seq,1)+1 \
+         WHERE adventure_guid=?1 AND COALESCE(status,'active')='active'",
+        params![guid],
+    )?;
+    Ok(())
+}
 
     /// Adventures whose detail shows reviews and haven't been scraped.
     pub async fn pending_review_guids(&self) -> Result<Vec<String>> {
@@ -725,6 +1027,10 @@ impl Db {
     }
 
     /// Persist one adventure's review pages + flip reviews_done — one tx.
+    /// Never-delete: changed reviews archive the old row, vanished ones
+    /// are tombstoned (each processed adventure is a full listing, so
+    /// absence is conclusive), reappeared ones restore. Unchanged rows
+    /// are not touched at all.
     pub async fn save_reviews(
         &self,
         guid: String,
@@ -733,47 +1039,139 @@ impl Db {
     ) -> Result<u64> {
         self.run(move |c| {
             let tx = c.transaction()?;
-            let mut inserted = 0u64;
+            let mut written = 0u64;
+            tx.execute("CREATE TEMP TABLE seen_ids(id INTEGER PRIMARY KEY)", [])?;
             {
+                let mut known: std::collections::HashMap<i64, (String, Option<String>)> =
+                    std::collections::HashMap::new();
                 let mut stmt = tx.prepare(
-                    "INSERT OR REPLACE INTO reviews (id, adventure_guid, rating, \
+                    "SELECT id, COALESCE(status,'active'), content_hash FROM reviews \
+                     WHERE adventure_guid=?1",
+                )?;
+                for row in stmt.query_map(params![guid], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })? {
+                    let (id, st, h) = row?;
+                    known.insert(id, (st, h));
+                }
+                let mut ins = tx.prepare(
+                    "INSERT INTO reviews (id, adventure_guid, rating, \
                        review_text, player_username, player_public_guid, \
                        player_geocache_find_count, player_completed_adventure_count, \
                        recommended, is_creator, created_utc, completed_utc, \
-                       images_json, tags_json, raw_json) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                       images_json, tags_json, raw_json, status, content_hash, \
+                       version_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15, \
+                       'active',?16,1)",
                 )?;
+                let mut seen_ins =
+                    tx.prepare("INSERT OR IGNORE INTO seen_ids(id) VALUES (?1)")?;
                 for r in &items {
                     let Some(id) = i(r, "id") else { continue };
+                    seen_ins.execute(params![id])?;
                     let images = r.get("images").cloned().unwrap_or(Value::Null);
                     let tags = r.get("playerTags").cloned().unwrap_or(Value::Null);
-                    inserted += stmt.execute(params![
-                        id,
-                        guid,
-                        i(r, "rating"),
-                        s(r, "reviewText"),
-                        s(r, "playerUsername"),
-                        s(r, "playerPublicGuid"),
-                        i(r, "playerGeocacheFindCount"),
-                        i(r, "playerCompletedAdventureCount"),
-                        b(r, "recommended"),
-                        b(r, "isCreator"),
-                        s(r, "createdUtc"),
-                        s(r, "adventureCompletedDateUtc"),
-                        serde_json::to_string(&images)?,
-                        serde_json::to_string(&tags)?,
-                        serde_json::to_string(r)?,
-                    ])? as u64;
+                    let raw = serde_json::to_string(r)?;
+                    let hash = content_hash(&raw);
+                    match known.remove(&id) {
+                        None => {
+                            ins.execute(params![
+                                id,
+                                guid,
+                                i(r, "rating"),
+                                s(r, "reviewText"),
+                                s(r, "playerUsername"),
+                                s(r, "playerPublicGuid"),
+                                i(r, "playerGeocacheFindCount"),
+                                i(r, "playerCompletedAdventureCount"),
+                                b(r, "recommended"),
+                                b(r, "isCreator"),
+                                s(r, "createdUtc"),
+                                s(r, "adventureCompletedDateUtc"),
+                                serde_json::to_string(&images)?,
+                                serde_json::to_string(&tags)?,
+                                raw,
+                                hash,
+                            ])?;
+                            written += 1;
+                        }
+                        Some((st, Some(h))) if st == "active" && h == hash => {}
+                        Some((st, prev_hash)) => {
+                            let changed =
+                                matches!(&prev_hash, Some(h) if *h != hash);
+                            if changed && st == "active" {
+                                tx.execute(
+                                    "INSERT INTO review_versions \
+                                       (review_id, version_seq, change, raw_json) \
+                                     SELECT id, COALESCE(version_seq,1), 'updated', raw_json \
+                                     FROM reviews WHERE id=?1",
+                                    params![id],
+                                )?;
+                            }
+                            tx.execute(
+                                "UPDATE reviews SET adventure_guid=?2, rating=?3, \
+                                 review_text=?4, player_username=?5, player_public_guid=?6, \
+                                 player_geocache_find_count=?7, \
+                                 player_completed_adventure_count=?8, recommended=?9, \
+                                 is_creator=?10, created_utc=?11, completed_utc=?12, \
+                                 images_json=?13, tags_json=?14, raw_json=?15, \
+                                 status='active', removed_at=NULL, content_hash=?16, \
+                                 fetched_at=CURRENT_TIMESTAMP, \
+                                 version_seq=COALESCE(version_seq,1)+1 WHERE id=?1",
+                                params![
+                                    id,
+                                    guid,
+                                    i(r, "rating"),
+                                    s(r, "reviewText"),
+                                    s(r, "playerUsername"),
+                                    s(r, "playerPublicGuid"),
+                                    i(r, "playerGeocacheFindCount"),
+                                    i(r, "playerCompletedAdventureCount"),
+                                    b(r, "recommended"),
+                                    b(r, "isCreator"),
+                                    s(r, "createdUtc"),
+                                    s(r, "adventureCompletedDateUtc"),
+                                    serde_json::to_string(&images)?,
+                                    serde_json::to_string(&tags)?,
+                                    raw,
+                                    hash,
+                                ],
+                            )?;
+                            written += 1;
+                        }
+                    }
                 }
             }
+            // Reviews in the DB but absent from this full listing were
+            // deleted (or made private): archive + tombstone, keep data.
+            tx.execute(
+                "INSERT INTO review_versions \
+                   (review_id, version_seq, change, raw_json) \
+                 SELECT id, COALESCE(version_seq,1), 'removed', raw_json FROM reviews \
+                 WHERE adventure_guid=?1 AND COALESCE(status,'active')='active' \
+                   AND id NOT IN (SELECT id FROM seen_ids)",
+                params![guid],
+            )?;
+            tx.execute(
+                "UPDATE reviews SET status='removed', removed_at=CURRENT_TIMESTAMP, \
+                 version_seq=COALESCE(version_seq,1)+1 \
+                 WHERE adventure_guid=?1 AND COALESCE(status,'active')='active' \
+                   AND id NOT IN (SELECT id FROM seen_ids)",
+                params![guid],
+            )?;
             tx.execute(
                 "UPDATE adventures SET reviews_done=1, reviews_error=NULL, \
+                 reviews_checked_at=CURRENT_TIMESTAMP, \
                  reviews_total_count=MAX(COALESCE(reviews_total_count,0), ?2) \
                  WHERE guid=?1",
                 params![guid, total_count],
             )?;
             tx.commit()?;
-            Ok(inserted)
+            Ok(written)
         })
         .await
     }
@@ -786,6 +1184,66 @@ impl Db {
                 params![guid, err],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    // ── refresh mode ────────────────────────────────────────────────────
+
+    /// Re-queue finished cells for a refresh pass: done/failed cells go
+    /// back to pending from offset 0. Subdivided parents stay put (their
+    /// children cover the area). Discovery inserts are idempotent
+    /// (`labs.guid` dedup), so re-walking only adds newly-appeared labs.
+    pub async fn requeue_done(&self) -> Result<u64> {
+        self.run(|c| {
+            Ok(c.execute(
+                "UPDATE queue SET status='pending', next_skip=0, attempts=0, \
+                 updated_at=CURRENT_TIMESTAMP WHERE status IN ('done','failed')",
+                [],
+            )? as u64)
+        })
+        .await
+    }
+
+    /// Stalest-first detail re-fetch candidates (refresh mode). -1 = all.
+    /// Only live, previously-good rows: errors/unfetched stay in the
+    /// `fetch` (pending) lane, removed rows stay tombstoned until a
+    /// revisit proves otherwise — which this also does, since a restored
+    /// adventure answers 200 again and `save_adventure` revives it.
+    pub async fn refetch_guids(&self, limit: i64) -> Result<Vec<String>> {
+        self.run(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT guid FROM adventures \
+                 WHERE COALESCE(status,'active')='active' \
+                 ORDER BY fetched_at ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for g in rows {
+                out.push(g?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Stalest-first reviews re-scrape candidates (refresh mode). -1 = all.
+    /// `reviews_checked_at` advances on every completed scrape, so each
+    /// pass works through the least-recently-checked adventures first.
+    pub async fn revisit_review_guids(&self, limit: i64) -> Result<Vec<String>> {
+        self.run(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT guid FROM adventures \
+                 WHERE http_status=200 AND COALESCE(status,'active')='active' \
+                   AND reviews_done=1 AND COALESCE(reviews_total_count,0) > 0 \
+                 ORDER BY COALESCE(reviews_checked_at,'1970-01-01') ASC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for g in rows {
+                out.push(g?);
+            }
+            Ok(out)
         })
         .await
     }
@@ -963,6 +1421,7 @@ impl Db {
                 "SELECT l.guid, l.raw_json, a.raw_json, a.owner_username, \
                  a.reviews_total_count FROM labs l \
                  LEFT JOIN adventures a ON a.guid = l.guid AND a.http_status = 200 \
+                   AND COALESCE(a.status,'active') = 'active' \
                  WHERE l.guid GLOB '{prefix}*'",
             ))?;
             let rows = stmt.query_map([], |r| {
@@ -995,6 +1454,7 @@ impl Db {
             let mut stmt = c.prepare(&format!(
                 "SELECT adventure_guid, raw_json FROM reviews \
                  WHERE adventure_guid GLOB '{prefix}*' \
+                   AND COALESCE(status,'active') = 'active' \
                  ORDER BY created_utc DESC",
             ))?;
             let rows = stmt.query_map([], |r| {
@@ -1096,6 +1556,12 @@ impl Db {
 }
 
 // ── JSON extraction helpers ─────────────────────────────────────────────
+
+/// Content hash for change detection (never-delete versioning). md5 is
+/// fine here — this is a fingerprint, not security.
+fn content_hash(raw: &str) -> String {
+    format!("{:x}", md5::compute(raw.as_bytes()))
+}
 
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(|x| x.as_str()).map(String::from)

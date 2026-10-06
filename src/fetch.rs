@@ -28,6 +28,9 @@ pub struct Args {
     pub bearer: String,
     /// Fetch at most N GUIDs (0 = all pending).
     pub max: usize,
+    /// Refresh mode: re-fetch already-fetched details stalest-first
+    /// instead of only pending GUIDs. Updates version history.
+    pub restudy: bool,
 }
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
@@ -44,7 +47,14 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         Arc::new(Client::new(args.rate, None)?)
     };
     let has_bearer = client.has_bearer();
-    let guids = db.pending_guids(has_bearer).await?;
+    let guids = if args.restudy {
+        let lim = if args.max > 0 { args.max as i64 } else { -1 };
+        let g = db.refetch_guids(lim).await?;
+        info!("restudy: {} adventures to re-fetch (stalest first)", g.len());
+        g
+    } else {
+        db.pending_guids(has_bearer).await?
+    };
     let total = guids.len();
     if total == 0 {
         info!("nothing to fetch — {}", db.stats().await?);
