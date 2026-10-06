@@ -96,13 +96,13 @@ enum Cmd {
     /// updates, removals and restores append to version history.
     Refresh {
         /// Max aggregate crawl requests/sec.
-        #[arg(long, default_value_t = 10.0)]
+        #[arg(long, default_value_t = 20.0)]
         crawl_rate: f64,
         /// Max aggregate fetch requests/sec.
-        #[arg(long, default_value_t = 12.0)]
+        #[arg(long, default_value_t = 40.0)]
         fetch_rate: f64,
         /// Max aggregate reviews requests/sec.
-        #[arg(long, default_value_t = 12.0)]
+        #[arg(long, default_value_t = 40.0)]
         reviews_rate: f64,
         /// Re-fetch at most N stalest details (0 = all).
         #[arg(long, default_value_t = 0)]
