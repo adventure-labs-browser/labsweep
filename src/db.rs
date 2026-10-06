@@ -716,7 +716,7 @@ impl Db {
                     let changed =
                         matches!(&prev_hash, Some(h) if *h != hash);
                     if restored || changed {
-                        archive_adventure(
+                        Self::archive_adventure(
                             &tx,
                             &guid,
                             if restored { "restored" } else { "updated" },
