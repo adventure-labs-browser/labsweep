@@ -147,6 +147,7 @@ fn detail_entry(
 
 pub async fn run(db: Db, args: Args) -> Result<()> {
     fs::create_dir_all(args.out.join("detail"))?;
+    fs::create_dir_all(args.out.join("history"))?;
 
     // One 2-hex-guid shard at a time: query rows, reviews and cracks for
     // that prefix only, write the shard, drop everything. Peak memory is
@@ -155,6 +156,10 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let mut shard_bytes = 0u64;
     let mut total = 0usize;
     let mut n_shards = 0usize;
+    let mut history_bytes = 0u64;
+    let mut history_events = 0usize;
+    let mut history_shards = 0usize;
+    let mut recent_changes: Vec<Value> = Vec::new();
     for i in 0u32..256 {
         let prefix = format!("{i:02x}");
         let rows = db.catalog_rows_prefix(prefix.clone()).await?;
@@ -187,6 +192,24 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         let path = args.out.join("detail").join(format!("{prefix}.json.gz"));
         shard_bytes += gz_write(&path, &Value::Object(shard))?;
         n_shards += 1;
+
+        let history = db.history_prefix(prefix.clone()).await?;
+        if !history.is_empty() {
+            for (guid, events) in &history {
+                history_events += events.len();
+                for event in events {
+                    let mut summary = event.clone();
+                    if let Some(m) = summary.as_object_mut() {
+                        m.remove("d");
+                        m.insert("g".into(), json!(guid));
+                    }
+                    recent_changes.push(summary);
+                }
+            }
+            let hpath = args.out.join("history").join(format!("{prefix}.json.gz"));
+            history_bytes += gz_write(&hpath, &serde_json::to_value(&history)?)?;
+            history_shards += 1;
+        }
         if n_shards.is_multiple_of(32) {
             info!("detail: {} shards written", n_shards);
         }
@@ -204,6 +227,36 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         total,
         n_shards,
         shard_bytes as f64 / 1e6
+    );
+
+    recent_changes.sort_by(|a, b| {
+        b.get("at").and_then(Value::as_str).unwrap_or("")
+            .cmp(a.get("at").and_then(Value::as_str).unwrap_or(""))
+    });
+    recent_changes.truncate(2_000);
+    gz_write(&args.out.join("changes.json.gz"), &Value::Array(recent_changes))?;
+
+    let generated_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let meta = json!({
+        "generatedUnix": generated_unix,
+        "catalogEntries": n_cat,
+        "fetchedAdventures": total,
+        "detailShards": n_shards,
+        "detailBytes": shard_bytes,
+        "historyEvents": history_events,
+        "historyShards": history_shards,
+        "historyBytes": history_bytes
+    });
+    gz_write(&args.out.join("meta.json.gz"), &meta)?;
+
+    info!(
+        "history: {} events in {} shards ({:.1} MB gz)",
+        history_events,
+        history_shards,
+        history_bytes as f64 / 1e6
     );
     info!("export complete -> {}", args.out.display());
     Ok(())

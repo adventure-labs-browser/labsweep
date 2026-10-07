@@ -13,3 +13,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: node --check web/app.js
