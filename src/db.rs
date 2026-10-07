@@ -264,6 +264,20 @@ pub struct CatalogRow {
     pub reviews_total_count: Option<i64>,
 }
 
+fn compact_history_snapshot(raw: Option<&str>, keys: &[&str]) -> Value {
+    let Some(raw) = raw else { return Value::Null };
+    let Ok(Value::Object(src)) = serde_json::from_str::<Value>(raw) else {
+        return Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        if let Some(v) = src.get(*key) {
+            out.insert((*key).to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 #[derive(Default)]
 pub struct Stats {
     pub pending: u64,
@@ -1644,6 +1658,117 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             for r in rows {
                 let (g, si, p, d, m) = r?;
                 out.entry(g).or_default().push((si, p, d, m));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Version-history events for one 2-hex GUID prefix, grouped by
+    /// adventure. Snapshots stay in their original JSON form so the static
+    /// viewer can show what changed without a backend.
+    pub async fn history_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Value>>> {
+        self.run(move |c| {
+            let mut out: std::collections::BTreeMap<String, Vec<Value>> =
+                std::collections::BTreeMap::new();
+
+            {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT adventure_guid, version_seq, superseded_at, change, raw_json \
+                     FROM adventure_versions WHERE adventure_guid GLOB '{prefix}*' \
+                     ORDER BY superseded_at DESC",
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (g, seq, at, change, raw) = row?;
+                    let snapshot = compact_history_snapshot(raw.as_deref(), &[
+                        "title", "description", "adventureType", "medianTimeToComplete",
+                        "ratingsAverage", "ratingsTotalCount", "reviewsTotalCount",
+                        "completionCount", "recommendedCount", "ownerUsername",
+                        "publishedUtc", "visibility", "location", "isArchived",
+                        "isHighlyRecommended",
+                    ]);
+                    out.entry(g).or_default().push(serde_json::json!({
+                        "e":"adventure","v":seq,"at":at,"c":change,"d":snapshot
+                    }));
+                }
+            }
+
+            {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT adventure_guid, stage_index, version_seq, superseded_at, change, raw_json \
+                     FROM stage_versions WHERE adventure_guid GLOB '{prefix}*' \
+                     ORDER BY superseded_at DESC",
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (g, idx, seq, at, change, raw) = row?;
+                    let snapshot = compact_history_snapshot(raw.as_deref(), &[
+                        "title", "description", "challengeType", "question", "location",
+                        "geofencingRadius", "isComplete", "isFinal",
+                        "answerCodeHashesBase16v2",
+                    ]);
+                    out.entry(g).or_default().push(serde_json::json!({
+                        "e":"stage","i":idx,"v":seq,"at":at,"c":change,"d":snapshot
+                    }));
+                }
+            }
+
+            {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT r.adventure_guid, rv.review_id, rv.version_seq, \
+                            rv.superseded_at, rv.change, rv.raw_json \
+                     FROM review_versions rv JOIN reviews r ON r.id=rv.review_id \
+                     WHERE r.adventure_guid GLOB '{prefix}*' \
+                     ORDER BY rv.superseded_at DESC",
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (g, rid, seq, at, change, raw) = row?;
+                    let snapshot = compact_history_snapshot(raw.as_deref(), &[
+                        "rating", "reviewText", "playerUsername", "recommended",
+                        "isCreator", "createdUtc", "completedUtc", "playerTags",
+                    ]);
+                    out.entry(g).or_default().push(serde_json::json!({
+                        "e":"review","i":rid,"v":seq,"at":at,"c":change,"d":snapshot
+                    }));
+                }
+            }
+
+            for events in out.values_mut() {
+                events.sort_by(|a, b| {
+                    b.get("at").and_then(Value::as_str).unwrap_or("")
+                        .cmp(a.get("at").and_then(Value::as_str).unwrap_or(""))
+                });
             }
             Ok(out)
         })

@@ -1,0 +1,85 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "src/export.rs"
+      - "src/db.rs"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["daily"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build exporter
+        run: cargo build --release --locked
+
+      - name: Restore latest database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download db-latest -p 'labsweep.db.zst.part-*' --clobber
+          cat labsweep.db.zst.part-* | zstd -dc -o data/labsweep.db
+          rm -f labsweep.db.zst.part-*
+          ls -lh data/labsweep.db
+
+      - name: Export viewer dataset
+        run: |
+          rm -rf web/data
+          ./target/release/labsweep --db data/labsweep.db export --out web/data
+          touch web/.nojekyll
+          du -sh web web/data web/data/detail web/data/history
+          find web/data/detail -type f -name '*.json.gz' | wc -l
+          find web/data/history -type f -name '*.json.gz' | wc -l
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
