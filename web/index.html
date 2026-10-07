@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1117">
+<meta name="description" content="Worldwide Adventure Labs explorer with live data and change history.">
+<title>labsweep — worldwide adventure labs</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2430; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --good: #3fb950;
+    --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #app { display: flex; height: 100%; }
+
+  /* ── left panel ── */
+  #side { width: 380px; min-width: 380px; display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--border); z-index: 5; }
+  #hdr { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  #hdr h1 { margin: 0; font-size: 15px; letter-spacing: .5px; }
+  #hdr h1 span { color: var(--accent); }
+  #stats { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  #search { width: 100%; margin-top: 8px; padding: 7px 9px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--text); outline: none; }
+  #search:focus { border-color: var(--accent); }
+  #filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); align-items: center; }
+  #filters label { display: flex; align-items: center; gap: 4px; color: var(--dim);
+    font-size: 11.5px; cursor: pointer; user-select: none; }
+  #filters select, #filters input[type=number] { background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px; padding: 3px 5px; font-size: 11.5px; width: 64px; }
+  #filters select { width: auto; }
+  #sortbar { display: flex; gap: 4px; padding: 6px 12px; border-bottom: 1px solid var(--border);
+    align-items: center; font-size: 11.5px; color: var(--dim); }
+  .sortbtn { background: var(--panel2); border: 1px solid var(--border); color: var(--dim);
+    border-radius: 5px; padding: 2px 8px; cursor: pointer; font-size: 11.5px; }
+  .sortbtn.on { color: var(--text); border-color: var(--accent); }
+  #count { margin-left: auto; color: var(--dim); }
+  #list { flex: 1; overflow-y: auto; position: relative; }
+  #spacer { width: 1px; }
+  .row { position: absolute; left: 0; right: 0; padding: 7px 12px; border-bottom: 1px solid var(--border);
+    cursor: pointer; overflow: hidden; }
+  .row:hover { background: var(--panel2); }
+  .row .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .s { color: var(--dim); font-size: 11.5px; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; margin-top: 1px; }
+  .row .s b { color: var(--warn); font-weight: 500; }
+  .row .s .hr { color: var(--good); }
+  .row .s .ac { color: var(--good); font-weight: 600; }
+  .row.unf { opacity: .45; }
+
+  /* ── map ── */
+  #map { flex: 1; position: relative; }
+  .maplibregl-ctrl-attrib { font-size: 10px; }
+  #mapmode { position: absolute; top: 10px; left: 10px; z-index: 5; display: flex;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 7px;
+    overflow: hidden; opacity: .92; }
+  #mapmode button { background: transparent; border: none; color: var(--dim);
+    padding: 5px 10px; font-size: 11.5px; cursor: pointer; }
+  #mapmode button + button { border-left: 1px solid var(--border); }
+  #mapmode button.on { background: var(--panel2); color: var(--text); }
+
+  /* ── detail drawer ── */
+  #drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 460px; max-width: 92vw;
+    background: var(--panel); border-left: 1px solid var(--border); z-index: 10;
+    transform: translateX(105%); transition: transform .18s ease; overflow-y: auto; }
+  #drawer.open { transform: none; }
+  #dhead { position: sticky; top: 0; background: var(--panel); padding: 12px 14px;
+    border-bottom: 1px solid var(--border); display: flex; gap: 10px; align-items: flex-start; }
+  #dhead h2 { margin: 0; font-size: 16px; flex: 1; }
+  #dclose { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 6px;
+    width: 28px; height: 28px; cursor: pointer; flex: none; }
+  #dclose:hover { color: var(--text); }
+  #dimg { width: 100%; max-height: 200px; object-fit: cover; display: block; }
+  .dsec { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .dsec h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--dim); }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 6px 14px; }
+  .kv div { font-size: 12px; }
+  .kv .k { color: var(--dim); display: block; font-size: 10.5px; text-transform: uppercase; }
+  #ddesc, .stage .sd { font-size: 12.5px; color: var(--text); overflow-wrap: break-word; }
+  #ddesc a, .stage .sd a { color: var(--accent); }
+  #ddesc img, .stage .sd img { max-width: 100%; border-radius: 6px; }
+  #ddesc p, .stage .sd p { margin: 6px 0; }
+  .stage { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; margin-bottom: 8px; }
+  .stage .st { font-weight: 600; font-size: 13px; }
+  .stage .sq { margin-top: 6px; font-size: 12.5px; }
+  .stage .ans { margin-top: 6px; font-size: 13px; color: var(--good); }
+  .stage .ans .chip { color: var(--dim); border-color: var(--border); }
+  .stage .sq .q { color: var(--accent); }
+  .stage .sm { margin-top: 6px; font-size: 11px; color: var(--dim); word-break: break-all; }
+  .stage .sm code { color: var(--warn); }
+  .rev { padding: 8px 0; border-top: 1px solid var(--border); }
+  .rev:first-child { border-top: none; }
+  .rev .rh { font-size: 11.5px; color: var(--dim); }
+  .rev .rh b { color: var(--text); }
+  .rev .stars { color: var(--warn); }
+  .rev .rt { font-size: 12.5px; margin-top: 3px; white-space: pre-wrap; }
+  .rev img { max-width: 90px; border-radius: 6px; margin: 4px 4px 0 0; }
+  .chip { display: inline-block; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1px 8px; font-size: 10.5px; color: var(--dim); margin: 2px 2px 0 0; }
+  #load { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: var(--bg); z-index: 50; flex-direction: column; gap: 12px; color: var(--dim); }
+  #loadbar { width: 260px; height: 4px; background: var(--panel2); border-radius: 2px; overflow: hidden; }
+  #loadbar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #quickbar { display:flex; gap:5px; align-items:center; margin-top:7px; flex-wrap:wrap; }
+  .qbtn { background:var(--panel2); border:1px solid var(--border); color:var(--dim); border-radius:5px; padding:3px 7px; cursor:pointer; font-size:11px; }
+  .qbtn:hover,.qbtn.on { color:var(--text); border-color:var(--accent); }
+  #freshness { margin-left:auto; color:var(--dim); font-size:10.5px; }
+  #freshness.fresh { color:var(--good); } #freshness.stale { color:var(--warn); }
+  #historyPanel { position:absolute; inset:0 0 0 auto; width:min(540px,96vw); background:var(--panel); border-left:1px solid var(--border); z-index:20; transform:translateX(102%); transition:transform .18s; overflow:auto; }
+  #historyPanel.open { transform:none; }
+  .hp-head { position:sticky; top:0; background:var(--panel); z-index:2; padding:12px 14px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; }
+  .hp-head h2 { margin:0; flex:1; font-size:16px; }
+  #historyBody { padding:12px 14px; }
+  .metric-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:14px; }
+  .metric { background:var(--panel2); border:1px solid var(--border); border-radius:7px; padding:8px; }
+  .metric b { display:block; font-size:16px; } .metric span { color:var(--dim); font-size:10px; }
+  .hist-event { border-top:1px solid var(--border); padding:8px 0; font-size:12px; }
+  .hist-event:first-child { border-top:0; } .hist-event time { color:var(--dim); font-size:10.5px; }
+  .hist-kind { color:var(--accent); } .hist-change { color:var(--warn); }
+  .hist-diff { margin-top:4px; color:var(--dim); font-size:11px; }
+  .hist-diff code { color:var(--text); }
+  .detail-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:9px; }
+  .fav-on { color:#f2cc60 !important; }
+  #toast { position:absolute; left:50%; bottom:22px; transform:translateX(-50%); background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:7px 12px; z-index:60; opacity:0; pointer-events:none; transition:opacity .15s; }
+  #toast.show { opacity:1; }
+  @media (max-width: 800px) { #side { width:310px; min-width:310px; } #filters { max-height:96px; overflow:auto; } .metric-grid { grid-template-columns:repeat(2,1fr); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <div id="hdr">
+      <h1>lab<span>sweep</span></h1>
+      <div id="stats">loading…</div>
+      <input id="search" placeholder="search title, owner, guid…" autocomplete="off">
+    </div>
+    <div id="filters">
+      <select id="ftype">
+        <option value="">all types</option>
+        <option value="Sequential">sequential</option>
+        <option value="Nonsequential">nonsequential</option>
+      </select>
+      <label>min★ <input type="number" id="fminr" min="0" max="5" step="0.5" value="0"></label>
+      <label>stages≥ <input type="number" id="fminst" min="0" max="10" value="0"></label>
+      <label>revs≥ <input type="number" id="fminrv" min="0" value="0"></label>
+      <label><input type="checkbox" id="fhr"> ★rec</label>
+      <label><input type="checkbox" id="ffetch"> fetched</label>
+      <label><input type="checkbox" id="fanswers"> answers</label>
+      <label><input type="checkbox" id="ffav"> ★saved</label>
+      <label><input type="checkbox" id="factive" checked> hide archived</label>
+    </div>
+    <div id="sortbar">
+      sort
+      <button class="sortbtn" data-k="ra">rating</button>
+      <button class="sortbtn" data-k="vc">reviews</button>
+      <button class="sortbtn" data-k="rc">ratings</button>
+      <button class="sortbtn" data-k="sc">stages</button>
+      <button class="sortbtn" data-k="p">newest</button>
+      <button class="sortbtn" data-k="dist" id="sortdist" hidden>distance</button>
+      <span id="count"></span>
+    </div>
+    <div id="list"><div id="spacer"></div></div>
+  </div>
+  <div id="map">
+    <div id="mapmode">
+      <button data-m="cluster" class="on">clusters</button>
+      <button data-m="heat">heat</button>
+      <button data-m="all">all points</button>
+    </div>
+  </div>
+  <div id="drawer">
+    <div id="dhead"><h2 id="dtitle"></h2><button id="dclose">✕</button></div>
+    <div id="dbody"></div>
+  </div>
+  <div id="historyPanel">
+    <div class="hp-head"><h2>history</h2><button class="qbtn" id="historyClose">close</button></div>
+    <div id="historyBody">loading…</div>
+  </div>
+  <div id="toast"></div>
+  <div id="load"><div>loading catalog…</div><div id="loadbar"><i></i></div><div id="loadmsg"></div></div>
+</div>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="app.js"></script>
+<script src="enhance.js"></script>
+<script src="extra.js"></script>
+</body>
+</html>

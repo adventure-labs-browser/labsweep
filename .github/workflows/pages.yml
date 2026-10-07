@@ -1,0 +1,96 @@
+name: pages
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["daily"]
+    types: [completed]
+  schedule:
+    - cron: "47 10 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "scripts/export_history.py"
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build exporter
+        run: cargo build --release --locked
+
+      - name: Restore latest database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download db-latest -p 'labsweep.db.zst.part-*' --clobber
+          cat labsweep.db.zst.part-* | zstd -dc -o data/labsweep.db
+          rm -f labsweep.db.zst.part-*
+          ls -lh data/labsweep.db
+
+      - name: Export current viewer data
+        env:
+          LABSWEEP_SOURCE_RELEASE: db-latest
+        run: |
+          rm -rf web/data
+          ./target/release/labsweep --db data/labsweep.db export --out web/data
+          python3 scripts/export_history.py --db data/labsweep.db --out web/data
+          touch web/.nojekyll
+          du -sh web web/data web/data/detail web/data/history
+
+      - name: Verify generated site
+        run: |
+          test -s web/data/catalog.json.gz
+          test -s web/data/meta.json
+          test -s web/data/history-summary.json.gz
+          test -s web/index.html
+          test -s web/history.html
+          bytes=$(du -sb web | cut -f1)
+          echo "GitHub Pages payload: $bytes bytes"
+          # GitHub Pages' officially supported published-site limit is 1 GB.
+          test "$bytes" -lt 1000000000
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

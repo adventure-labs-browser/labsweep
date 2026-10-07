@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>labsweep — dataset history</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2430;--border:#30363d;--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--good:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1180px;margin:auto;padding:22px}a{color:var(--accent);text-decoration:none}.head{display:flex;gap:14px;align-items:center;margin-bottom:18px}.head h1{font-size:18px;margin:0;flex:1}.btn{background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:6px 9px;border-radius:6px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:11px}.card span{display:block;color:var(--dim);text-transform:uppercase;font-size:10px}.card b{font-size:20px}
+.grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(340px,.85fr);gap:14px;margin-top:16px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}.panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);margin:0;padding:10px 12px;border-bottom:1px solid var(--border)}
+.chart{height:230px;padding:10px}.table{overflow:auto;max-height:560px}.row{display:grid;grid-template-columns:105px 70px 1fr 1fr 1fr;gap:8px;padding:7px 10px;border-top:1px solid var(--border);align-items:center}.row.headrow{border-top:0;color:var(--dim);font-size:10px;text-transform:uppercase;position:sticky;top:0;background:var(--panel);z-index:1}.event{padding:9px 11px;border-top:1px solid var(--border)}.event:first-child{border-top:0}.event .meta{color:var(--dim);font-size:11px}.pill{display:inline-block;border:1px solid var(--border);border-radius:10px;padding:0 6px;margin-left:4px;font-size:10px;color:var(--dim)}.muted{color:var(--dim)}.good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+@media(max-width:820px){main{padding:12px}.grid{grid-template-columns:1fr}.row{grid-template-columns:90px 55px 1fr}.row>*:nth-child(n+4){display:none}}
+</style>
+</head>
+<body>
+<main>
+  <div class="head"><h1>lab<span style="color:var(--accent)">sweep</span> dataset history</h1><a class="btn" href="./">← viewer</a></div>
+  <div id="status" class="muted">loading…</div>
+  <div id="cards" class="cards" style="margin-top:12px"></div>
+  <div class="grid">
+    <section class="panel">
+      <h2>changes by day</h2>
+      <div class="chart"><svg id="chart" viewBox="0 0 1000 220" width="100%" height="100%" preserveAspectRatio="none"></svg></div>
+      <div id="table" class="table"></div>
+    </section>
+    <section class="panel">
+      <h2>recent changes</h2>
+      <div id="recent"></div>
+    </section>
+  </div>
+</main>
+<script>
+(function(){
+  function n(v){return v==null?"—":Number(v).toLocaleString()}
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+  function fetchGz(url){return fetch(url,{cache:"no-cache"}).then(function(r){if(!r.ok)throw new Error(url+": "+r.status);return new Response(r.body.pipeThrough(new DecompressionStream("gzip"))).json()})}
+  Promise.all([
+    fetch("data/meta.json",{cache:"no-cache"}).then(function(r){return r.json()}),
+    fetchGz("data/history-summary.json.gz")
+  ]).then(function(res){
+    var meta=res[0]||{}, hist=res[1]||{}, counts=meta.counts||{};
+    var stamp=meta.generatedAt||meta.generated_at;
+    document.getElementById("status").innerHTML=
+      "current dataset built "+(stamp?new Date(stamp).toLocaleString():"unknown")+
+      " · "+esc(meta.sourceRelease||meta.source_release||"db-latest")+
+      (hist.freshness&&hist.freshness.latestHistoryChange?" · last recorded change "+esc(hist.freshness.latestHistoryChange):"");
+
+    var cards=[
+      ["labs",counts.labs],["full details",counts.adventures],["stages",counts.stages],
+      ["reviews",counts.reviews],["answers",counts.cracks],
+      ["adventure versions",counts.adventure_versions],["stage versions",counts.stage_versions],
+      ["review versions",counts.review_versions]
+    ];
+    document.getElementById("cards").innerHTML=cards.map(function(x){return '<div class="card"><span>'+x[0]+'</span><b>'+n(x[1])+'</b></div>'}).join("");
+
+    var days=(hist.days||[]).slice().reverse();
+    var svg=document.getElementById("chart");
+    if(days.length){
+      var vals=days.map(function(x){return Number(x.total||0)}), hi=Math.max.apply(null,vals.concat([1]));
+      var bars=days.map(function(x,i){
+        var w=920/Math.max(1,days.length), h=(Number(x.total||0)/hi)*165, x0=45+i*w, y=190-h;
+        return '<rect x="'+x0+'" y="'+y+'" width="'+Math.max(2,w-2)+'" height="'+h+'" fill="#58a6ff" opacity=".8"><title>'+esc(x.date)+': '+n(x.total)+' changes</title></rect>';
+      }).join("");
+      svg.innerHTML='<text x="12" y="18" fill="#8b949e">'+n(hi)+'</text>'+bars+
+        '<line x1="42" y1="190" x2="980" y2="190" stroke="#30363d"/>';
+    } else {
+      svg.innerHTML='<text x="20" y="40" fill="#8b949e">No version changes recorded yet.</text>';
+    }
+
+    var head='<div class="row headrow"><span>date</span><span>total</span><span>adventure</span><span>stage</span><span>review</span></div>';
+    var rows=(hist.days||[]).map(function(x){
+      var k=x.kinds||{}, c=x.changes||{};
+      var detail=Object.keys(c).sort().map(function(key){return esc(key)+": "+n(c[key])}).join(" · ");
+      return '<div class="row"><span>'+esc(x.date)+'</span><b>'+n(x.total)+'</b><span>'+n(k.adventure||0)+'</span><span>'+n(k.stage||0)+'</span><span>'+n(k.review||0)+'</span></div>'+
+        (detail?'<div style="padding:0 10px 7px;color:var(--dim);font-size:10px">'+detail+'</div>':"");
+    }).join("");
+    document.getElementById("table").innerHTML=head+rows;
+
+    var recent=(hist.recent||[]).map(function(x){
+      var href="./?lab="+encodeURIComponent(x.g||"");
+      return '<div class="event"><a href="'+href+'"><b>'+esc(x.title||x.g||"(unknown)")+'</b></a> '+
+        '<span class="pill">'+esc(x.k)+'</span><span class="pill">'+esc(x.c)+'</span>'+
+        (x.x==null?"":'<span class="pill">#'+esc(x.x)+'</span>')+
+        '<div class="meta">'+esc((x.t||"").replace("T"," ").slice(0,19))+' · '+esc(x.g||"")+'</div></div>';
+    }).join("");
+    document.getElementById("recent").innerHTML=recent||'<div class="event muted">No recorded changes yet.</div>';
+  }).catch(function(e){document.getElementById("status").textContent="failed to load history: "+e.message});
+})();
+</script>
+</body>
+</html>
