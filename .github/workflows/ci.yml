@@ -13,3 +13,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check static viewer
+        run: |
+          node --check web/app.js
+          python3 -m py_compile scripts/export_pages_meta.py scripts/test_pages_export.py
+          python3 scripts/test_pages_export.py
