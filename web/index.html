@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1117">
+<meta name="description" content="Worldwide Adventure Lab catalog, map, details and version history.">
+<title>labsweep — worldwide adventure labs</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2430; --panel3:#212b38; --border:#30363d;
+    --text:#e6edf3; --dim:#8b949e; --accent:#58a6ff; --good:#3fb950; --warn:#d29922;
+    --bad:#f85149; --shadow:0 16px 50px rgba(0,0,0,.35);
+  }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  button, input, select { font:inherit; }
+  button { cursor:pointer; }
+  #app { display:flex; height:100%; overflow:hidden; }
+
+  /* left panel */
+  #side { width:390px; min-width:390px; display:flex; flex-direction:column;
+    background:var(--panel); border-right:1px solid var(--border); z-index:5; }
+  #hdr { padding:10px 12px; border-bottom:1px solid var(--border); }
+  #brandrow { display:flex; align-items:center; gap:8px; }
+  #brandrow h1 { margin:0; font-size:15px; letter-spacing:.5px; }
+  #brandrow h1 span { color:var(--accent); }
+  #fresh { margin-left:auto; padding:1px 7px; border:1px solid #234d37; border-radius:10px;
+    color:var(--good); font-size:10.5px; white-space:nowrap; }
+  #fresh.stale { color:var(--warn); border-color:#614b18; }
+  #stats { color:var(--dim); font-size:11.5px; margin-top:3px; min-height:17px; }
+  #tools { display:flex; gap:5px; margin-top:8px; flex-wrap:wrap; }
+  .toolbtn, .detail-actions button, #dhead button {
+    background:var(--panel2); border:1px solid var(--border); color:var(--dim);
+    border-radius:6px; padding:4px 8px; font-size:11.5px;
+  }
+  .toolbtn:hover, .detail-actions button:hover, #dhead button:hover { color:var(--text); border-color:#55606f; }
+  .toolbtn:disabled { opacity:.55; cursor:wait; }
+  #search { width:100%; margin-top:8px; padding:7px 9px; background:var(--panel2);
+    border:1px solid var(--border); border-radius:6px; color:var(--text); outline:none; }
+  #search:focus { border-color:var(--accent); box-shadow:0 0 0 2px rgba(88,166,255,.08); }
+
+  #filters { display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px;
+    border-bottom:1px solid var(--border); align-items:center; }
+  #filters label { display:flex; align-items:center; gap:4px; color:var(--dim);
+    font-size:11.5px; cursor:pointer; user-select:none; }
+  #filters select, #filters input[type=number] { background:var(--panel2); color:var(--text);
+    border:1px solid var(--border); border-radius:5px; padding:3px 5px; font-size:11.5px; width:64px; }
+  #filters select { width:auto; }
+
+  #sortbar { display:flex; gap:4px; padding:6px 12px; border-bottom:1px solid var(--border);
+    align-items:center; font-size:11.5px; color:var(--dim); flex-wrap:wrap; }
+  .sortbtn { background:var(--panel2); border:1px solid var(--border); color:var(--dim);
+    border-radius:5px; padding:2px 7px; cursor:pointer; font-size:11.5px; }
+  .sortbtn.on { color:var(--text); border-color:var(--accent); }
+  .sortbtn:disabled { opacity:.35; cursor:not-allowed; }
+  #count { margin-left:auto; color:var(--dim); white-space:nowrap; }
+
+  #list { flex:1; overflow-y:auto; position:relative; }
+  #spacer { width:1px; }
+  .row { position:absolute; left:0; right:0; padding:7px 12px; border-bottom:1px solid var(--border);
+    cursor:pointer; overflow:hidden; }
+  .row:hover { background:var(--panel2); }
+  .row .t { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .s { color:var(--dim); font-size:11.5px; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; margin-top:1px; }
+  .row .s b { color:var(--warn); font-weight:500; }
+  .row .s .hr, .row .s .ac { color:var(--good); }
+  .row.unf { opacity:.48; }
+  .favmark { color:var(--warn); display:inline-block; min-width:0; margin-right:0; }
+  .favmark:not(:empty) { margin-right:5px; }
+
+  /* map */
+  #map { flex:1; position:relative; min-width:0; }
+  .maplibregl-ctrl-attrib { font-size:10px; }
+  .maplibregl-ctrl-group { background:var(--panel)!important; }
+  .maplibregl-ctrl-group button { filter:invert(.85); }
+  #mapmode { position:absolute; top:10px; left:10px; z-index:5; display:flex;
+    background:var(--panel); border:1px solid var(--border); border-radius:7px;
+    overflow:hidden; opacity:.94; box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  #mapmode button { background:transparent; border:none; color:var(--dim);
+    padding:5px 10px; font-size:11.5px; cursor:pointer; }
+  #mapmode button + button { border-left:1px solid var(--border); }
+  #mapmode button.on { background:var(--panel2); color:var(--text); }
+
+  /* drawer */
+  #drawer { position:absolute; top:0; right:0; bottom:0; width:500px; max-width:94vw;
+    background:var(--panel); border-left:1px solid var(--border); z-index:10;
+    transform:translateX(105%); transition:transform .18s ease; overflow-y:auto; box-shadow:var(--shadow); }
+  #drawer.open { transform:none; }
+  #dhead { position:sticky; top:0; z-index:2; background:rgba(22,27,34,.97); backdrop-filter:blur(8px);
+    padding:10px 12px; border-bottom:1px solid var(--border); display:flex; gap:7px; align-items:flex-start; }
+  #dhead h2 { margin:2px 0 0; font-size:16px; flex:1; min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  #dhead-actions { display:flex; gap:5px; }
+  #dhead button { min-width:30px; height:28px; padding:3px 7px; }
+  #dfav.on { color:var(--warn); border-color:#735d1d; }
+
+  #dimg { width:100%; max-height:230px; object-fit:cover; display:block; background:var(--panel2); }
+  .dsec { padding:12px 14px; border-bottom:1px solid var(--border); }
+  .dsec h3 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); }
+  .kv { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:7px 14px; }
+  .kv div { font-size:12px; min-width:0; overflow-wrap:anywhere; }
+  .kv .k { color:var(--dim); display:block; font-size:10.5px; text-transform:uppercase; }
+  .detail-actions { display:flex; gap:6px; margin-top:10px; }
+  #ddesc, .stage .sd { font-size:12.5px; color:var(--text); overflow-wrap:break-word; }
+  #ddesc a, .stage .sd a { color:var(--accent); }
+  #ddesc img, .stage .sd img { max-width:100%; border-radius:6px; }
+  #ddesc p, .stage .sd p { margin:6px 0; }
+
+  .stage { background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+    padding:10px; margin-bottom:8px; }
+  .stage .st { font-weight:600; font-size:13px; }
+  .stage .sq { margin-top:6px; font-size:12.5px; }
+  .stage .ans { margin-top:6px; font-size:13px; color:var(--good); }
+  .stage .ans .chip { color:var(--dim); border-color:var(--border); }
+  .stage .sq .q { color:var(--accent); }
+  .stage .sm { margin-top:6px; font-size:11px; color:var(--dim); word-break:break-all; }
+  .stage .sm code { color:var(--warn); }
+
+  .rev { padding:8px 0; border-top:1px solid var(--border); }
+  .rev:first-child { border-top:none; }
+  .rev .rh { font-size:11.5px; color:var(--dim); }
+  .rev .rh b { color:var(--text); }
+  .rev .stars { color:var(--warn); }
+  .rev .rt { font-size:12.5px; margin-top:3px; white-space:pre-wrap; }
+  .rev img { max-width:90px; border-radius:6px; margin:4px 4px 0 0; }
+
+  .chip { display:inline-block; background:var(--panel2); border:1px solid var(--border);
+    border-radius:10px; padding:1px 8px; font-size:10.5px; color:var(--dim); margin:2px 2px 0 0; }
+  .muted { color:var(--dim); font-size:11.5px; }
+
+  /* history */
+  .hist { border:1px solid var(--border); border-radius:8px; margin:7px 0; overflow:hidden; background:var(--panel2); }
+  .histhead { padding:7px 9px; border-bottom:1px solid var(--border); font-size:11.5px; }
+  .histhead b { color:var(--accent); }
+  .histhead span { float:right; color:var(--dim); font-size:10.5px; }
+  .histdiff { display:grid; grid-template-columns:100px minmax(0,1fr) 16px minmax(0,1fr);
+    gap:5px; padding:5px 8px; border-top:1px solid rgba(48,54,61,.65); font-size:11px; align-items:start; }
+  .histdiff:first-of-type { border-top:none; }
+  .histdiff b { color:var(--dim); overflow:hidden; text-overflow:ellipsis; }
+  .histdiff span { overflow-wrap:anywhere; max-height:54px; overflow:hidden; }
+  .histdiff i { color:var(--accent); font-style:normal; text-align:center; }
+  .hist > .muted { padding:6px 8px; }
+
+  /* recent changes */
+  .change-list { display:flex; flex-direction:column; }
+  .change-row { display:flex; width:100%; text-align:left; align-items:center; gap:10px;
+    border:0; border-top:1px solid var(--border); background:transparent; color:var(--text); padding:8px 0; }
+  .change-row:first-child { border-top:0; }
+  .change-row:hover { color:var(--accent); }
+  .change-row > span { flex:1; min-width:0; }
+  .change-row b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .change-row small { display:block; color:var(--dim); margin-top:1px; }
+  .change-row time { color:var(--dim); font-size:10.5px; max-width:125px; text-align:right; }
+
+  /* loading */
+  #load { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background:var(--bg); z-index:50; flex-direction:column; gap:12px; color:var(--dim); }
+  #loadbar { width:min(300px,70vw); height:4px; background:var(--panel2); border-radius:2px; overflow:hidden; }
+  #loadbar i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+
+  @media (max-width:900px) {
+    #side { width:330px; min-width:330px; }
+    #drawer { width:460px; }
+  }
+  @media (max-width:650px) {
+    #side { width:58vw; min-width:58vw; }
+    #drawer { width:100vw; max-width:100vw; }
+    #mapmode { left:6px; top:6px; }
+    #mapmode button { padding:5px 7px; }
+    .histdiff { grid-template-columns:80px minmax(0,1fr); }
+    .histdiff i { display:none; }
+    .histdiff span:last-child::before { content:"→ "; color:var(--accent); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div id="hdr">
+      <div id="brandrow">
+        <h1>lab<span>sweep</span></h1>
+        <span id="fresh">loading…</span>
+      </div>
+      <div id="stats">loading…</div>
+      <div id="tools">
+        <button class="toolbtn" id="recent" title="latest version-history events">history</button>
+        <button class="toolbtn" id="near" title="sort labs by distance from you">near me</button>
+        <button class="toolbtn" id="exportcsv" title="download the currently filtered catalog">export CSV</button>
+        <button class="toolbtn" id="reset" title="reset filters">reset</button>
+      </div>
+      <input id="search" placeholder="search title, owner, guid…  (/)" autocomplete="off">
+    </div>
+
+    <div id="filters">
+      <select id="ftype">
+        <option value="">all types</option>
+        <option value="Sequential">sequential</option>
+        <option value="Nonsequential">nonsequential</option>
+      </select>
+      <label>min★ <input type="number" id="fminr" min="0" max="5" step="0.5" value="0"></label>
+      <label>stages≥ <input type="number" id="fminst" min="0" max="100" value="0"></label>
+      <label>revs≥ <input type="number" id="fminrv" min="0" value="0"></label>
+      <label><input type="checkbox" id="fhr"> ★rec</label>
+      <label><input type="checkbox" id="ffetch"> fetched</label>
+      <label><input type="checkbox" id="factive" checked> hide archived</label>
+      <label><input type="checkbox" id="ffav"> ★ saved</label>
+    </div>
+
+    <div id="sortbar">
+      sort
+      <button class="sortbtn" data-k="ra">rating</button>
+      <button class="sortbtn" data-k="vc">reviews</button>
+      <button class="sortbtn" data-k="rc">ratings</button>
+      <button class="sortbtn" data-k="sc">stages</button>
+      <button class="sortbtn" data-k="p">newest</button>
+      <button class="sortbtn" data-k="dist" disabled>distance</button>
+      <span id="count"></span>
+    </div>
+    <div id="list"><div id="spacer"></div></div>
+  </aside>
+
+  <main id="map">
+    <div id="mapmode">
+      <button data-m="cluster" class="on">clusters</button>
+      <button data-m="heat">heat</button>
+      <button data-m="all">all points</button>
+    </div>
+  </main>
+
+  <section id="drawer" aria-live="polite">
+    <div id="dhead">
+      <h2 id="dtitle"></h2>
+      <div id="dhead-actions">
+        <button id="dfav" title="save favorite">☆</button>
+        <button id="dshare" title="copy permalink">share</button>
+      </div>
+      <button id="dclose" title="close">✕</button>
+    </div>
+    <div id="dbody"></div>
+  </section>
+
+  <div id="load">
+    <div>loading worldwide catalog…</div>
+    <div id="loadbar"><i></i></div>
+    <div id="loadmsg"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
