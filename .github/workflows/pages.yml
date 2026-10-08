@@ -30,7 +30,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve database snapshot
+        id: db
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "release_id=$(gh api repos/${{ github.repository }}/releases/tags/db-latest --jq .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached viewer dataset
+        id: viewer-cache
+        uses: actions/cache@v4
+        with:
+          path: web/data
+          key: labsweep-pages-data-${{ steps.db.outputs.release_id }}-${{ hashFiles('src/export.rs', 'src/db.rs') }}
+
       - name: Free disk space
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
         uses: jlumbroso/free-disk-space@main
         with:
           android: true
@@ -39,12 +53,16 @@ jobs:
           large-packages: true
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
 
       - name: Build exporter
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
         run: cargo build --release --locked
 
       - name: Restore latest database
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -55,18 +73,24 @@ jobs:
           ls -lh data/labsweep.db
 
       - name: Export viewer dataset
+        if: steps.viewer-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf web/data
           ./target/release/labsweep --db data/labsweep.db export --out web/data
+
+      - name: Validate viewer dataset
+        run: |
+          test -s web/data/catalog.json.gz
+          test -s web/data/meta.json.gz
+          test -d web/data/detail
+          test -d web/data/history
           touch web/.nojekyll
-          du -sh web web/data web/data/detail web/data/history
+          du -sh web web/data
           find web/data/detail -type f -name '*.json.gz' | wc -l
           find web/data/history -type f -name '*.json.gz' | wc -l
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
