@@ -3,8 +3,8 @@
 //! Produces a fully self-contained `web/data/` directory — no server
 //! needed, the SPA gunzips everything client-side:
 //!
-//!   catalog.json.gz     one compact record per lab (fetched or not)
-//!   detail/{xx}.json.gz full detail per fetched adventure, grouped
+//!   catalog.json.gz     one compact record per fully-fetched live adventure
+//!   detail/{xx}.json.gz full detail per adventure, grouped
 //!                       into ≤256 shards by the guid's first byte
 //!
 //! Re-run after fetch/reviews finish to refresh the dataset.
@@ -184,9 +184,6 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
                 let revs = reviews.get(&r.guid).cloned().unwrap_or_default();
                 shard.insert(r.guid.clone(), detail_entry(&v, revs, &ans));
                 total += 1;
-            } else if let Some(lab) = &r.lab_json {
-                let v: Value = serde_json::from_str(lab)?;
-                catalog.push(catalog_entry(&r.guid, &v, false, None, 0, 0));
             }
         }
         let path = args.out.join("detail").join(format!("{prefix}.json.gz"));

@@ -694,12 +694,12 @@ impl Db {
                  WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL \
                     OR a.raw_json NOT LIKE '%findCodeHashBase16v2%' \
                     OR a.raw_json NOT LIKE '%answerCodeHashesBase16v2%') \
-                   AND COALESCE(a.status,'active') = 'active' \
+                   AND COALESCE(a.status,'active') <> 'removed' \
                    AND (a.next_retry_at IS NULL OR a.next_retry_at <= CURRENT_TIMESTAMP)"
             } else {
                 "SELECT l.guid FROM labs l LEFT JOIN adventures a ON a.guid = l.guid \
                  WHERE (a.guid IS NULL OR a.http_status <> 200 OR a.error IS NOT NULL) \
-                   AND COALESCE(a.status,'active') = 'active' \
+                   AND COALESCE(a.status,'active') <> 'removed' \
                    AND (a.next_retry_at IS NULL OR a.next_retry_at <= CURRENT_TIMESTAMP)"
             };
             let mut stmt = c.prepare(sql)?;
@@ -745,8 +745,11 @@ impl Db {
                 (None, Some(d)) => {
                     Self::insert_adventure(&tx, &guid, &d, status)?;
                 }
-                (Some((_, prev_http, prev_status)), None) => {
-                    let was_good = prev_http == Some(200);
+                (Some((prev_hash, prev_http, prev_status)), None) => {
+                    // content_hash only exists after a successful detail fetch.
+                    // Treat that as authoritative even if a prior transient
+                    // failure overwrote http_status.
+                    let was_good = prev_hash.is_some() || prev_http == Some(200);
                     let active = prev_status.as_deref().unwrap_or("active") == "active";
                     if status == 404 && was_good && active {
                         // Tombstone: archive last-good, mark removed, keep
@@ -763,11 +766,16 @@ impl Db {
                         // Reviews are standalone records; they stay.
                         Self::tombstone_stages(&tx, &guid)?;
                     } else {
-                        // Transient failure (429/5xx/exhausted retries) or
-                        // a row that never had good data: record the error,
-                        // preserve everything else, no version row — but
-                        // back off so a permanently-failing row isn't
-                        // retried every run (1,2,4..30 days).
+                        // If we have a last-good snapshot, a transient refresh
+                        // failure must not make that snapshot disappear from
+                        // downstream consumers. Keep its data status at 200 and
+                        // store the failed attempt in error/backoff fields.
+                        // Never-good placeholders keep the actual failure status.
+                        let stored_status = if was_good && active {
+                            200_i64
+                        } else {
+                            status as i64
+                        };
                         tx.execute(
                             "UPDATE adventures SET http_status=?2, error=?3, \
                              fetched_at=CURRENT_TIMESTAMP, \
@@ -775,35 +783,45 @@ impl Db {
                              next_retry_at=datetime('CURRENT_TIMESTAMP', \
                                '+'||min(1 << COALESCE(failed_attempts,0),30)||' days') \
                              WHERE guid=?1",
-                            params![guid, status as i64, error],
+                            params![guid, stored_status, error],
                         )?;
                     }
                 }
                 (Some((prev_hash, _, prev_status)), Some(d)) => {
                     let raw = serde_json::to_string(&d)?;
                     let hash = content_hash(&raw);
+                    let unfetched = prev_status.as_deref() == Some("unfetched");
                     let restored = prev_status.as_deref().unwrap_or("active") == "removed";
-                    // NULL hash = pre-history row: adopt as baseline with
-                    // no archive, else the first refresh would double the DB.
-                    let changed =
-                        matches!(&prev_hash, Some(h) if *h != hash);
-                    if restored || changed {
-                        Self::archive_adventure(
-                            &tx,
-                            &guid,
-                            if restored { "restored" } else { "updated" },
-                        )?;
+                    if unfetched {
+                        // A failed first sighting is only a placeholder, not v1.
+                        // Hydrate it in place and make this successful snapshot v1.
                         Self::update_adventure(&tx, &guid, &d, status, &hash)?;
-                    } else {
-                        // Same content, still active: light touch + clear
-                        // any past failure backoff.
                         tx.execute(
-                            "UPDATE adventures SET http_status=?2, error=NULL, \
-                             fetched_at=CURRENT_TIMESTAMP, content_hash=?3, \
-                             failed_attempts=0, next_retry_at=NULL \
-                             WHERE guid=?1",
-                            params![guid, status as i64, hash],
+                            "UPDATE adventures SET version_seq=1 WHERE guid=?1",
+                            params![guid],
                         )?;
+                    } else {
+                        // NULL hash = pre-history row: adopt as baseline with
+                        // no archive, else the first refresh would double the DB.
+                        let changed = matches!(&prev_hash, Some(h) if *h != hash);
+                        if restored || changed {
+                            Self::archive_adventure(
+                                &tx,
+                                &guid,
+                                if restored { "restored" } else { "updated" },
+                            )?;
+                            Self::update_adventure(&tx, &guid, &d, status, &hash)?;
+                        } else {
+                            // Same content, still active: light touch + clear
+                            // any past failure backoff.
+                            tx.execute(
+                                "UPDATE adventures SET http_status=?2, error=NULL, \
+                                 fetched_at=CURRENT_TIMESTAMP, content_hash=?3, \
+                                 failed_attempts=0, next_retry_at=NULL \
+                                 WHERE guid=?1",
+                                params![guid, status as i64, hash],
+                            )?;
+                        }
                     }
                     Self::reconcile_stages(&tx, &guid, &d)?;
                 }
@@ -1572,7 +1590,8 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             let mut stmt = c.prepare(&format!(
                 "SELECT l.guid, l.raw_json, a.raw_json, a.owner_username, \
                  a.reviews_total_count FROM labs l \
-                 LEFT JOIN adventures a ON a.guid = l.guid AND a.http_status = 200 \
+                 JOIN adventures a ON a.guid = l.guid \
+                   AND a.raw_json <> '{}' \
                    AND COALESCE(a.status,'active') = 'active' \
                  WHERE l.guid GLOB '{prefix}*'",
             ))?;

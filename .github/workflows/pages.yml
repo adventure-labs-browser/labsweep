@@ -84,6 +84,13 @@ jobs:
           test -s web/data/meta.json.gz
           test -d web/data/detail
           test -d web/data/history
+          python3 - <<'PY'
+          import gzip, json
+          with gzip.open('web/data/catalog.json.gz', 'rt', encoding='utf-8') as f:
+              catalog = json.load(f)
+          incomplete = [x.get('g') for x in catalog if not x.get('f')]
+          assert not incomplete, f"viewer catalog contains {len(incomplete)} discovery-only rows"
+          PY
           touch web/.nojekyll
           du -sh web web/data
           find web/data/detail -type f -name '*.json.gz' | wc -l
