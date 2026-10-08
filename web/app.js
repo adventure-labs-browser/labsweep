@@ -101,8 +101,8 @@ function applyFilters() {
   filtered.sort((a, b) => (b[k] ?? -Infinity) - (a[k] ?? -Infinity));
   $("count").textContent = `${filtered.length.toLocaleString()} shown`;
   renderList();
-  pushMapData();
-  setFlatFilter();
+  clusterDirty = heatDirty = allDirty = true;
+  updateActiveMapMode();
 }
 
 let deb;
@@ -117,7 +117,8 @@ function bindUi() {
     document.querySelectorAll(".sortbtn").forEach(x => x.classList.remove("on"));
     b.classList.add("on");
     state.sort = b.dataset.k;
-    applyFilters();
+    filtered.sort((a, b) => (b[state.sort] ?? -Infinity) - (a[state.sort] ?? -Infinity));
+    renderList();                 // sorting does not change anything on the map
   }));
   document.querySelector('.sortbtn[data-k="ra"]').classList.add("on");
   $("dclose").onclick = () => {
@@ -252,6 +253,11 @@ function renderList() {
 
 /* ── map ── */
 let map;
+let mapMode = "cluster";
+let clusterDirty = true, heatDirty = true, allDirty = true;
+const FAST_GRID_N = 256;
+const fastGrid = new Map();
+
 function colorExpr() {
   return ["case",
     ["!", ["get", "f"]], "#4a5568",
@@ -259,6 +265,145 @@ function colorExpr() {
     ["interpolate", ["linear"], ["get", "ra"],
       1, "#f85149", 3, "#d29922", 4.5, "#3fb950", 5, "#2ea043"]];
 }
+function mercatorXY(lon, lat) {
+  const x = (lon + 180) / 360;
+  const clamped = Math.max(-85.051129, Math.min(85.051129, lat));
+  const r = clamped * Math.PI / 180;
+  const y = (1 - Math.log(Math.tan(Math.PI / 4 + r / 2)) / Math.PI) / 2;
+  return [x, y];
+}
+
+function prepareFastPoints() {
+  fastGrid.clear();
+  for (const x of CAT) {
+    if (x.la == null || x.lo == null) continue;
+    const m = mercatorXY(x.lo, x.la);
+    x._mx = m[0]; x._my = m[1];
+    const bx = Math.max(0, Math.min(FAST_GRID_N - 1, Math.floor(m[0] * FAST_GRID_N)));
+    const by = Math.max(0, Math.min(FAST_GRID_N - 1, Math.floor(m[1] * FAST_GRID_N)));
+    const key = by * FAST_GRID_N + bx;
+    let bucket = fastGrid.get(key);
+    if (!bucket) fastGrid.set(key, bucket = []);
+    bucket.push(x);
+  }
+}
+
+function shader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+    throw new Error("all-points shader: " + gl.getShaderInfoLog(sh));
+  return sh;
+}
+
+const fastAllLayer = {
+  id: "pts-all-fast",
+  type: "custom",
+  renderingMode: "2d",
+  visible: false,
+  count: 0,
+  pending: null,
+  onAdd(m, gl) {
+    this.map = m; this.gl = gl;
+    const vs = shader(gl, gl.VERTEX_SHADER,
+      "precision highp float;" +
+      "attribute vec2 a_pos; attribute float a_rating; attribute float a_fetched;" +
+      "uniform mat4 u_matrix; uniform float u_size; varying vec4 v_color;" +
+      "void main(){" +
+      "gl_Position=u_matrix*vec4(a_pos,0.0,1.0); gl_PointSize=u_size;" +
+      "if(a_fetched<0.5) v_color=vec4(.29,.33,.41,.78);" +
+      "else if(a_rating<0.0) v_color=vec4(.35,.65,1.0,.82);" +
+      "else if(a_rating<3.0) v_color=mix(vec4(.97,.32,.29,.84),vec4(.82,.60,.13,.84),clamp((a_rating-1.0)/2.0,0.0,1.0));" +
+      "else if(a_rating<4.5) v_color=mix(vec4(.82,.60,.13,.84),vec4(.25,.73,.31,.84),clamp((a_rating-3.0)/1.5,0.0,1.0));" +
+      "else v_color=vec4(.18,.63,.26,.86);}");
+    const fs = shader(gl, gl.FRAGMENT_SHADER,
+      "precision mediump float; varying vec4 v_color;" +
+      "void main(){vec2 p=gl_PointCoord-vec2(.5);if(dot(p,p)>.25)discard;gl_FragColor=v_color;}");
+    const program = gl.createProgram();
+    gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+      throw new Error("all-points program: " + gl.getProgramInfoLog(program));
+    this.program = program;
+    this.buffer = gl.createBuffer();
+    this.aPos = gl.getAttribLocation(program, "a_pos");
+    this.aRating = gl.getAttribLocation(program, "a_rating");
+    this.aFetched = gl.getAttribLocation(program, "a_fetched");
+    this.uMatrix = gl.getUniformLocation(program, "u_matrix");
+    this.uSize = gl.getUniformLocation(program, "u_size");
+    if (this.pending) this.update(this.pending);
+  },
+  update(rows) {
+    this.pending = rows;
+    if (!this.gl || !this.buffer) return;
+    const data = new Float32Array(rows.length * 4);
+    let n = 0;
+    for (const x of rows) {
+      if (x._mx == null) continue;
+      const o = n * 4;
+      data[o] = x._mx; data[o + 1] = x._my;
+      data[o + 2] = x.ra == null ? -1 : x.ra;
+      data[o + 3] = x.f ? 1 : 0;
+      n++;
+    }
+    const view = n === rows.length ? data : data.subarray(0, n * 4);
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, view, gl.DYNAMIC_DRAW);
+    this.count = n;
+    this.map.triggerRepaint();
+  },
+  render(gl, matrix) {
+    if (!this.visible || !this.count) return;
+    const blend = gl.isEnabled(gl.BLEND), depth = gl.isEnabled(gl.DEPTH_TEST);
+    gl.useProgram(this.program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+    gl.enableVertexAttribArray(this.aPos);
+    gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(this.aRating);
+    gl.vertexAttribPointer(this.aRating, 1, gl.FLOAT, false, 16, 8);
+    gl.enableVertexAttribArray(this.aFetched);
+    gl.vertexAttribPointer(this.aFetched, 1, gl.FLOAT, false, 16, 12);
+    gl.uniformMatrix4fv(this.uMatrix, false, matrix);
+    const z = this.map.getZoom();
+    gl.uniform1f(this.uSize, Math.max(1.6, Math.min(7, 1.2 + z * .38)));
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.DEPTH_TEST);
+    gl.drawArrays(gl.POINTS, 0, this.count);
+    if (!blend) gl.disable(gl.BLEND);
+    if (depth) gl.enable(gl.DEPTH_TEST);
+  },
+  onRemove(_m, gl) {
+    if (this.buffer) gl.deleteBuffer(this.buffer);
+    if (this.program) gl.deleteProgram(this.program);
+  }
+};
+
+function nearestFastPoint(e) {
+  if (mapMode !== "all") return null;
+  const m = mercatorXY(e.lngLat.lng, e.lngLat.lat);
+  const radius = 10 / (512 * Math.pow(2, map.getZoom()));
+  const span = Math.max(1, Math.ceil(radius * FAST_GRID_N));
+  const bx = Math.floor(m[0] * FAST_GRID_N), by = Math.floor(m[1] * FAST_GRID_N);
+  let best = null, bestD = radius * radius;
+  for (let yy = by - span; yy <= by + span; yy++) {
+    if (yy < 0 || yy >= FAST_GRID_N) continue;
+    for (let xx = bx - span; xx <= bx + span; xx++) {
+      const wx = (xx + FAST_GRID_N) % FAST_GRID_N;
+      const bucket = fastGrid.get(yy * FAST_GRID_N + wx);
+      if (!bucket) continue;
+      for (const x of bucket) {
+        if (!passFilters(x)) continue;
+        let dx = Math.abs(x._mx - m[0]); dx = Math.min(dx, 1 - dx);
+        const dy = x._my - m[1], d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = x; }
+      }
+    }
+  }
+  return best;
+}
+
 function initMap() {
   map = new maplibregl.Map({
     container: "map",
@@ -306,12 +451,12 @@ function initMap() {
       map.on("mouseenter", l, () => map.getCanvas().style.cursor = "pointer"),
       map.on("mouseleave", l, () => map.getCanvas().style.cursor = "");
 
-    /* flat source: every point, indexed once, filtered via layer filter
-       (setFilter never re-tiles — this is what keeps "all" mode lag-free).
-       maxzoom caps the geojson-vt tile pyramid; higher zooms overzoom. */
+    /* Heatmap keeps a single immutable GeoJSON source. A small tile buffer
+       avoids the huge duplication caused by the old 512px buffer. All-points
+       uses a custom WebGL VBO instead of GeoJSON tiling entirely. */
     map.addSource("labs-flat", {
       type: "geojson", data: { type: "FeatureCollection", features: [] },
-      maxzoom: 12, buffer: 512          // wide buffer so heat splats aren't clipped at tile edges
+      maxzoom: 10, buffer: 64
     });
     map.addLayer({ id: "heat", type: "heatmap", source: "labs-flat",
       layout: { visibility: "none" },
@@ -322,25 +467,25 @@ function initMap() {
           0, "rgba(28,58,94,0)", .15, "rgba(28,58,94,.55)", .35, "#58a6ff",
           .55, "#3fb950", .75, "#d29922", 1, "#f85149"],
         "heatmap-opacity": .85 } });
-    map.addLayer({ id: "pts-all", type: "circle", source: "labs-flat",
-      layout: { visibility: "none" },
-      paint: { "circle-color": colorExpr(),
-        "circle-radius": ["interpolate", ["linear"], ["zoom"], 1, 1.3, 4, 2.2, 8, 3.5, 12, 5.5],
-        "circle-opacity": .8, "circle-stroke-width": 0 } });
-    map.on("click", "pts-all", e => {
-      const f = e.features[0];
-      openDetail(f.properties.g, ...f.geometry.coordinates.slice().reverse());
-    });
-    map.on("mouseenter", "pts-all", () => map.getCanvas().style.cursor = "pointer");
-    map.on("mouseleave", "pts-all", () => map.getCanvas().style.cursor = "");
 
-    pushMapData();
-    setTimeout(loadFlat, 60);   // index all points off the boot critical path
+    prepareFastPoints();
+    map.addLayer(fastAllLayer);
+    map.on("click", e => {
+      const x = nearestFastPoint(e);
+      if (x) openDetail(x.g, x.la, x.lo);
+    });
+    map.on("mousemove", e => {
+      if (mapMode === "all") map.getCanvas().style.cursor = nearestFastPoint(e) ? "pointer" : "";
+    });
+
+    updateActiveMapMode();
   });
 }
 
-let flatReady = false;
+let flatReady = false, flatLoading = false;
 function loadFlat() {
+  if (flatReady || flatLoading) return;
+  flatLoading = true;
   const feats = [];
   for (const x of CAT) {
     if (x.la == null) continue;
@@ -354,10 +499,12 @@ function loadFlat() {
   }
   map.getSource("labs-flat").setData({ type: "FeatureCollection", features: feats });
   flatReady = true;
-  setFlatFilter();
+  flatLoading = false;
+  heatDirty = true;
+  if (mapMode === "heat") setHeatFilter();
 }
 
-/* mirrors passFilters() as a MapLibre layer filter for labs-flat layers */
+/* mirrors passFilters() for the immutable heatmap source */
 function mapFilterExpr() {
   const all = ["all"];
   if (state.q) {
@@ -376,33 +523,47 @@ function mapFilterExpr() {
   if ($("factive").checked) all.push(["!=", ["coalesce", ["get", "arch"], false], true]);
   return all;
 }
-function setFlatFilter() {
-  if (!map || !flatReady) return;
-  const f = mapFilterExpr();
-  map.setFilter("heat", f);
-  map.setFilter("pts-all", f);
+function setHeatFilter() {
+  if (!map || !flatReady || !map.getLayer("heat")) return;
+  map.setFilter("heat", mapFilterExpr());
+  heatDirty = false;
+}
+function updateAllPoints() {
+  if (!fastAllLayer.gl) return;
+  fastAllLayer.update(filtered);
+  allDirty = false;
+}
+function updateActiveMapMode() {
+  if (!map || !map.getLayer("heat")) return;
+  if (mapMode === "cluster" && clusterDirty) pushMapData();
+  else if (mapMode === "heat" && heatDirty) setHeatFilter();
+  else if (mapMode === "all" && allDirty) updateAllPoints();
 }
 function setMode(m) {
+  mapMode = m;
   document.querySelectorAll("#mapmode button").forEach(b =>
     b.classList.toggle("on", b.dataset.m === m));
   if (!map || !map.getLayer("heat")) return;
   const v = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
   v("clust", m === "cluster"); v("clust-n", m === "cluster"); v("pts", m === "cluster");
   v("heat", m === "heat");
-  v("pts-all", m === "all");
+  fastAllLayer.visible = m === "all";
+  if (m !== "all") map.getCanvas().style.cursor = "";
+  if (m === "heat" && !flatReady) loadFlat();
+  updateActiveMapMode();
+  map.triggerRepaint();
 }
 function pushMapData() {
   if (!map || !map.getSource("labs")) return;
-  const feats = new Array(filtered.length);
-  for (let i = 0; i < filtered.length; i++) {
-    const x = filtered[i];
+  const feats = [];
+  for (const x of filtered) {
     if (x.la == null) continue;
-    feats[i] = { type: "Feature",
+    feats.push({ type: "Feature",
       geometry: { type: "Point", coordinates: [x.lo, x.la] },
-      properties: { g: x.g, ra: x.ra ?? 0, f: !!x.f } };
+      properties: { g: x.g, ra: x.ra ?? 0, f: !!x.f } });
   }
-  map.getSource("labs").setData({ type: "FeatureCollection",
-    features: feats.filter(Boolean) });
+  map.getSource("labs").setData({ type: "FeatureCollection", features: feats });
+  clusterDirty = false;
 }
 
 /* ── detail drawer ── */
