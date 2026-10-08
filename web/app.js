@@ -319,7 +319,11 @@ const fastAllLayer = {
       "else v_color=vec4(.18,.63,.26,.86);}");
     const fs = shader(gl, gl.FRAGMENT_SHADER,
       "precision mediump float; varying vec4 v_color;" +
-      "void main(){vec2 p=gl_PointCoord-vec2(.5);if(dot(p,p)>.25)discard;gl_FragColor=v_color;}");
+      "void main(){vec2 p=gl_PointCoord-vec2(.5);float d=dot(p,p);" +
+      "if(d>.25)discard;" +
+      "if(d>.185)gl_FragColor=vec4(.015,.02,.025,.98);" +
+      "else if(d>.115)gl_FragColor=vec4(1.0,1.0,1.0,.98);" +
+      "else gl_FragColor=vec4(v_color.rgb,1.0);}");
     const program = gl.createProgram();
     gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS))
@@ -366,7 +370,9 @@ const fastAllLayer = {
     gl.vertexAttribPointer(this.aFetched, 1, gl.FLOAT, false, 16, 12);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
     const z = this.map.getZoom();
-    gl.uniform1f(this.uSize, Math.max(1.6, Math.min(7, 1.2 + z * .38)));
+    // Black outer edge + white keyline keep points distinct on any basemap.
+    // Stay large enough to read at world zoom without turning dense cities solid.
+    gl.uniform1f(this.uSize, Math.max(4.6, Math.min(10.0, 4.0 + z * .48)));
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.DEPTH_TEST);
