@@ -94,7 +94,9 @@
   #ddesc img, .stage .sd img { max-width: 100%; border-radius: 6px; }
   #ddesc p, .stage .sd p { margin: 6px 0; }
   .stage { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px; margin-bottom: 8px; }
+    padding: 10px; margin-bottom: 8px; transition: border-color .18s, box-shadow .18s; }
+  .stage.focus { border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(88,166,255,.28), 0 0 22px rgba(88,166,255,.18); }
   .stage .st { font-weight: 600; font-size: 13px; }
   .stage .sq { margin-top: 6px; font-size: 12.5px; }
   .stage .ans { margin-top: 6px; font-size: 13px; color: var(--good); }
@@ -120,6 +122,18 @@
   .change-row { padding: 8px 0; border-top: 1px solid var(--border); cursor: pointer; }
   .change-row:hover { color: var(--accent); }
   .change-row small { display: block; color: var(--dim); }
+  .change-controls { position: sticky; top: 0; z-index: 2; display: flex; gap: 10px;
+    align-items: center; justify-content: space-between; padding: 7px 0 9px;
+    background: var(--panel); border-bottom: 1px solid var(--border); font-size: 11.5px; color: var(--dim); }
+  .change-controls label { cursor: pointer; }
+  #sellegend { display: none; position: absolute; top: 48px; left: 10px; z-index: 5;
+    background: rgba(22,27,34,.92); border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 9px; font-size: 11px; color: var(--dim); pointer-events: none; }
+  #sellegend.on { display: flex; gap: 10px; align-items: center; }
+  #sellegend i { width: 10px; height: 10px; display: inline-block; border-radius: 50%;
+    margin-right: 4px; vertical-align: -1px; border: 1.5px solid #0d1117; }
+  #sellegend .main-dot { background: #58a6ff; box-shadow: 0 0 0 1px #fff; }
+  #sellegend .stage-dot { background: #d29922; }
   .chip { display: inline-block; background: var(--panel2); border: 1px solid var(--border);
     border-radius: 10px; padding: 1px 8px; font-size: 10.5px; color: var(--dim); margin: 2px 2px 0 0; }
   #load { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -175,6 +189,7 @@
       <button data-m="heat">heat</button>
       <button data-m="all">all points</button>
     </div>
+    <div id="sellegend"><span><i class="main-dot"></i>entry point</span><span><i class="stage-dot"></i>stage</span><span>ring = geofence</span></div>
   </div>
   <div id="drawer">
     <div id="dhead"><h2 id="dtitle"></h2><button id="dshare">copy link</button><button id="dclose">✕</button></div>
