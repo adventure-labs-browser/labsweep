@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: github-pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -77,6 +77,9 @@ jobs:
         run: |
           rm -rf web/data
           ./target/release/labsweep --db data/labsweep.db export --out web/data
+
+      - name: Build balanced recent-changes index
+        run: python3 scripts/build_changes.py web/data
 
       - name: Validate viewer dataset
         run: |

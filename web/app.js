@@ -40,6 +40,10 @@ let CHANGES = [];
 const shards = new Map();     // "xx" -> {guid: detail}
 const historyShards = new Map();
 const state = { q: "", sort: "ra", sel: null };
+let changesHideReviews = true;
+let selectedDetail = null;
+let selectedBounds = null;
+let selectedMapPending = null;
 
 /* ── boot ── */
 async function boot() {
@@ -124,6 +128,8 @@ function bindUi() {
   $("dclose").onclick = () => {
     $("drawer").classList.remove("open");
     state.sel = null;
+    selectedDetail = null;
+    clearSelectedMap();
     $("dshare").style.display = "";
     const u = new URL(location.href);
     u.searchParams.delete("g");
@@ -151,7 +157,12 @@ function bindUi() {
   window.addEventListener("resize", renderList);
   window.addEventListener("popstate", () => {
     const g = new URLSearchParams(location.search).get("g");
-    if (!g) $("drawer").classList.remove("open");
+    if (!g) {
+      $("drawer").classList.remove("open");
+      state.sel = null;
+      selectedDetail = null;
+      clearSelectedMap();
+    }
   });
   document.querySelectorAll("#mapmode button").forEach(b =>
     b.onclick = () => setMode(b.dataset.m));
@@ -203,10 +214,18 @@ function exportCsv() {
 
 function showChanges() {
   state.sel = null;
+  selectedDetail = null;
+  clearSelectedMap();
   $("drawer").classList.add("open");
   $("dtitle").textContent = "recent changes";
   $("dshare").style.display = "none";
-  const rows = CHANGES.slice(0, 500).map(c => {
+  renderChanges();
+}
+
+function renderChanges() {
+  const source = changesHideReviews ? CHANGES.filter(c => c.e !== "review") : CHANGES;
+  const shown = source.slice(0, 500);
+  const rows = shown.map(c => {
     const x = CAT.find(v => v.g === c.g);
     const label = x?.t || c.g;
     const entity = c.e === "stage" ? `stage #${(c.i ?? 0) + 1}` :
@@ -215,7 +234,17 @@ function showChanges() {
       <b>${esc(label)}</b> · ${esc(c.c)} ${esc(entity)}
       <small>${esc(c.at || "")}</small></div>`;
   }).join("");
-  $("dbody").innerHTML = `<div class="dsec">${rows || "<i>no version history yet</i>"}</div>`;
+  $("dbody").innerHTML = `<div class="dsec">
+    <div class="change-controls">
+      <label><input id="change-no-reviews" type="checkbox" ${changesHideReviews ? "checked" : ""}> hide review changes</label>
+      <span>${Math.min(500, source.length).toLocaleString()} of ${source.length.toLocaleString()}</span>
+    </div>
+    ${rows || "<i>no version history yet</i>"}
+  </div>`;
+  $("change-no-reviews").onchange = e => {
+    changesHideReviews = e.target.checked;
+    renderChanges();
+  };
   $("dbody").querySelectorAll(".change-row").forEach(n => n.onclick = () => {
     const x = CAT.find(v => v.g === n.dataset.g);
     if (x) openDetail(x.g, x.la, x.lo);
@@ -312,18 +341,16 @@ const fastAllLayer = {
       "uniform mat4 u_matrix; uniform float u_size; varying vec4 v_color;" +
       "void main(){" +
       "gl_Position=u_matrix*vec4(a_pos,0.0,1.0); gl_PointSize=u_size;" +
-      "if(a_fetched<0.5) v_color=vec4(.29,.33,.41,.78);" +
-      "else if(a_rating<0.0) v_color=vec4(.35,.65,1.0,.82);" +
-      "else if(a_rating<3.0) v_color=mix(vec4(.97,.32,.29,.84),vec4(.82,.60,.13,.84),clamp((a_rating-1.0)/2.0,0.0,1.0));" +
-      "else if(a_rating<4.5) v_color=mix(vec4(.82,.60,.13,.84),vec4(.25,.73,.31,.84),clamp((a_rating-3.0)/1.5,0.0,1.0));" +
-      "else v_color=vec4(.18,.63,.26,.86);}");
+      "if(a_fetched<0.5) v_color=vec4(74.0/255.0,85.0/255.0,104.0/255.0,1.0);" +
+      "else if(a_rating<0.0) v_color=vec4(88.0/255.0,166.0/255.0,255.0/255.0,1.0);" +
+      "else if(a_rating<3.0) v_color=mix(vec4(248.0/255.0,81.0/255.0,73.0/255.0,1.0),vec4(210.0/255.0,153.0/255.0,34.0/255.0,1.0),clamp((a_rating-1.0)/2.0,0.0,1.0));" +
+      "else if(a_rating<4.5) v_color=mix(vec4(210.0/255.0,153.0/255.0,34.0/255.0,1.0),vec4(63.0/255.0,185.0/255.0,80.0/255.0,1.0),clamp((a_rating-3.0)/1.5,0.0,1.0));" +
+      "else v_color=mix(vec4(63.0/255.0,185.0/255.0,80.0/255.0,1.0),vec4(46.0/255.0,160.0/255.0,67.0/255.0,1.0),clamp((a_rating-4.5)/0.5,0.0,1.0));}");
     const fs = shader(gl, gl.FRAGMENT_SHADER,
-      "precision mediump float; varying vec4 v_color;" +
-      "void main(){vec2 p=gl_PointCoord-vec2(.5);float d=dot(p,p);" +
-      "if(d>.25)discard;" +
-      "if(d>.185)gl_FragColor=vec4(.015,.02,.025,.98);" +
-      "else if(d>.115)gl_FragColor=vec4(1.0,1.0,1.0,.98);" +
-      "else gl_FragColor=vec4(v_color.rgb,1.0);}");
+      "precision mediump float; varying vec4 v_color; uniform float u_radius;" +
+      "void main(){vec2 p=gl_PointCoord-vec2(.5);float px=length(p)*(u_radius*2.0);" +
+      "if(px>u_radius)discard;" +
+      "gl_FragColor=px>u_radius-0.8?vec4(13.0/255.0,17.0/255.0,23.0/255.0,1.0):v_color;}");
     const program = gl.createProgram();
     gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS))
@@ -335,6 +362,7 @@ const fastAllLayer = {
     this.aFetched = gl.getAttribLocation(program, "a_fetched");
     this.uMatrix = gl.getUniformLocation(program, "u_matrix");
     this.uSize = gl.getUniformLocation(program, "u_size");
+    this.uRadius = gl.getUniformLocation(program, "u_radius");
     if (this.pending) this.update(this.pending);
   },
   update(rows) {
@@ -370,9 +398,11 @@ const fastAllLayer = {
     gl.vertexAttribPointer(this.aFetched, 1, gl.FLOAT, false, 16, 12);
     gl.uniformMatrix4fv(this.uMatrix, false, matrix);
     const z = this.map.getZoom();
-    // Black outer edge + white keyline keep points distinct on any basemap.
-    // Stay large enough to read at world zoom without turning dense cities solid.
-    gl.uniform1f(this.uSize, Math.max(4.6, Math.min(10.0, 4.0 + z * .48)));
+    // Match the normal unclustered MapLibre point layer exactly:
+    // radius 3px at z<=4, linearly to 5px at z>=10, 0.8px #0d1117 stroke.
+    const radius = z <= 4 ? 3 : z >= 10 ? 5 : 3 + (z - 4) / 3;
+    gl.uniform1f(this.uSize, radius * 2);
+    gl.uniform1f(this.uRadius, radius);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.DEPTH_TEST);
@@ -451,7 +481,7 @@ function initMap() {
     });
     map.on("click", "pts", e => {
       const p = e.features[0].properties;
-      openDetail(p.g, ...e.features[0].geometry.coordinates.slice().reverse());
+      openDetail(p.g, ...e.features[0].geometry.coordinates.slice().reverse(), true);
     });
     for (const l of ["clust", "pts"])
       map.on("mouseenter", l, () => map.getCanvas().style.cursor = "pointer"),
@@ -476,15 +506,63 @@ function initMap() {
 
     prepareFastPoints();
     map.addLayer(fastAllLayer);
+
+    // Selected-adventure overlay: entry point, numbered stages and geofences.
+    map.addSource("selected", {
+      type: "geojson", data: { type: "FeatureCollection", features: [] }
+    });
+    map.addLayer({ id: "selected-geofence", type: "fill", source: "selected",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      paint: { "fill-color": "#d29922", "fill-opacity": .08 } });
+    map.addLayer({ id: "selected-geofence-line", type: "line", source: "selected",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      paint: { "line-color": "#d29922", "line-width": 1.5, "line-opacity": .85 } });
+    map.addLayer({ id: "selected-main", type: "circle", source: "selected",
+      filter: ["all", ["==", ["geometry-type"], "Point"], ["==", ["get", "kind"], "main"]],
+      paint: { "circle-color": "#58a6ff", "circle-radius": 8,
+        "circle-stroke-width": 3, "circle-stroke-color": "#ffffff" } });
+    map.addLayer({ id: "selected-stage", type: "circle", source: "selected",
+      filter: ["all", ["==", ["geometry-type"], "Point"], ["==", ["get", "kind"], "stage"]],
+      paint: { "circle-color": "#d29922", "circle-radius": 8,
+        "circle-stroke-width": 1.5, "circle-stroke-color": "#0d1117" } });
+    map.addLayer({ id: "selected-stage-n", type: "symbol", source: "selected",
+      filter: ["all", ["==", ["geometry-type"], "Point"], ["==", ["get", "kind"], "stage"]],
+      layout: { "text-field": ["to-string", ["get", "n"]], "text-size": 10,
+        "text-allow-overlap": true },
+      paint: { "text-color": "#0d1117" } });
+
+    map.on("click", "selected-stage", e => {
+      const i = +e.features[0].properties.i;
+      scrollToStage(i);
+    });
+    map.on("click", "selected-main", () => fitSelectedMap());
+    for (const l of ["selected-main", "selected-stage"])
+      map.on("mouseenter", l, () => map.getCanvas().style.cursor = "pointer"),
+      map.on("mouseleave", l, () => map.getCanvas().style.cursor = "");
+
     map.on("click", e => {
+      const sel = map.queryRenderedFeatures(e.point, {
+        layers: ["selected-main", "selected-stage"]
+      });
+      if (sel.length) return;
       const x = nearestFastPoint(e);
-      if (x) openDetail(x.g, x.la, x.lo);
+      if (x) openDetail(x.g, x.la, x.lo, true);
     });
     map.on("mousemove", e => {
-      if (mapMode === "all") map.getCanvas().style.cursor = nearestFastPoint(e) ? "pointer" : "";
+      if (mapMode === "all") {
+        const sel = map.queryRenderedFeatures(e.point, {
+          layers: ["selected-main", "selected-stage"]
+        });
+        map.getCanvas().style.cursor = sel.length || nearestFastPoint(e) ? "pointer" : "";
+      }
     });
 
     updateActiveMapMode();
+    if (selectedMapPending && selectedDetail === selectedMapPending.d) {
+      const q = selectedMapPending;
+      selectedMapPending = null;
+      showSelectedMap(q.d, q.fit, q.fallbackLa, q.fallbackLo);
+    }
   });
 }
 
@@ -564,12 +642,92 @@ function pushMapData() {
   const feats = [];
   for (const x of filtered) {
     if (x.la == null) continue;
+    const p = { g: x.g, f: !!x.f };
+    if (x.ra != null) p.ra = x.ra;
     feats.push({ type: "Feature",
       geometry: { type: "Point", coordinates: [x.lo, x.la] },
-      properties: { g: x.g, ra: x.ra ?? 0, f: !!x.f } });
+      properties: p });
   }
   map.getSource("labs").setData({ type: "FeatureCollection", features: feats });
   clusterDirty = false;
+}
+
+function geofencePolygon(lon, lat, radius, steps = 48) {
+  const coords = [];
+  const latScale = 111320;
+  const lonScale = Math.max(1, latScale * Math.cos(lat * Math.PI / 180));
+  for (let i = 0; i <= steps; i++) {
+    const a = i / steps * Math.PI * 2;
+    coords.push([
+      lon + Math.cos(a) * radius / lonScale,
+      lat + Math.sin(a) * radius / latScale,
+    ]);
+  }
+  return coords;
+}
+
+function clearSelectedMap() {
+  selectedBounds = null;
+  selectedMapPending = null;
+  if (map?.getSource("selected"))
+    map.getSource("selected").setData({ type: "FeatureCollection", features: [] });
+  $("sellegend")?.classList.remove("on");
+}
+
+function showSelectedMap(d, fit = false, fallbackLa = null, fallbackLo = null) {
+  if (!map) return;
+  if (!map.getSource("selected")) {
+    selectedMapPending = { d, fit, fallbackLa, fallbackLo };
+    return;
+  }
+  const feats = [];
+  const bounds = new maplibregl.LngLatBounds();
+  const main = d.location || (fallbackLa != null ? { latitude: fallbackLa, longitude: fallbackLo } : null);
+  if (main?.latitude != null && main?.longitude != null) {
+    const c = [main.longitude, main.latitude];
+    feats.push({ type: "Feature", geometry: { type: "Point", coordinates: c },
+      properties: { kind: "main" } });
+    bounds.extend(c);
+  }
+
+  (d.stageSummaries || []).forEach((stage, i) => {
+    const L = stage.location;
+    if (!L || L.latitude == null || L.longitude == null) return;
+    const c = [L.longitude, L.latitude];
+    feats.push({ type: "Feature", geometry: { type: "Point", coordinates: c },
+      properties: { kind: "stage", i, n: i + 1 } });
+    bounds.extend(c);
+    const r = Number(stage.geofencingRadius || 0);
+    if (r > 0) {
+      const ring = geofencePolygon(L.longitude, L.latitude, r);
+      feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ring] },
+        properties: { kind: "geofence", i, n: i + 1, radius: r } });
+      ring.forEach(x => bounds.extend(x));
+    }
+  });
+
+  map.getSource("selected").setData({ type: "FeatureCollection", features: feats });
+  selectedBounds = bounds.isEmpty() ? null : bounds;
+  $("sellegend")?.classList.toggle("on", feats.some(f => f.geometry.type === "Point"));
+  if (fit) fitSelectedMap();
+}
+
+function fitSelectedMap() {
+  if (!map || !selectedBounds) return;
+  map.fitBounds(selectedBounds, {
+    padding: { right: $("drawer").offsetWidth + 55, left: 55, top: 65, bottom: 65 },
+    maxZoom: 15,
+    duration: 550,
+  });
+}
+
+function scrollToStage(i) {
+  const el = $("stage-" + i);
+  if (!el) return;
+  document.querySelectorAll(".stage.focus").forEach(x => x.classList.remove("focus"));
+  el.classList.add("focus");
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => el.classList.remove("focus"), 1800);
 }
 
 /* ── detail drawer ── */
@@ -597,7 +755,7 @@ async function getHistory(g) {
   return historyShards.get(key)[g] || [];
 }
 
-async function openDetail(g, la, lo) {
+async function openDetail(g, la, lo, fitStages = false) {
   state.sel = g;
   $("dshare").style.display = "";
   const u = new URL(location.href);
@@ -606,20 +764,24 @@ async function openDetail(g, la, lo) {
   $("drawer").classList.add("open");
   $("dtitle").textContent = "loading…";
   $("dbody").innerHTML = "";
-  if (la != null && map) map.flyTo({
+  clearSelectedMap();
+  const [d, hist] = await Promise.all([getDetail(g), getHistory(g)]);
+  if (state.sel !== g) return; // a newer click won while this shard was loading
+  const cat = CAT.find(x => x.g === g) || {};
+  if (!d) {
+    $("dtitle").textContent = cat.t || g;
+    $("dbody").innerHTML = `<div class="dsec">Detail data is unexpectedly unavailable. This catalog only contains fully fetched adventures.<br>
+      <span class="chip">${esc(g)}</span></div>`;
+    return;
+  }
+  selectedDetail = d;
+  renderDetail(d, hist);
+  showSelectedMap(d, fitStages, la, lo);
+  if (!fitStages && la != null && map) map.flyTo({
     center: [lo, la],
     zoom: Math.max(map.getZoom(), 10),
     padding: { right: $("drawer").offsetWidth + 40, left: 40, top: 40, bottom: 40 },
   });
-  const [d, hist] = await Promise.all([getDetail(g), getHistory(g)]);
-  const cat = CAT.find(x => x.g === g) || {};
-  if (!d) {
-    $("dtitle").textContent = cat.t || g;
-    $("dbody").innerHTML = `<div class="dsec">Discovery data only — detail not fetched yet.<br>
-      <span class="chip">${esc(g)}</span></div>`;
-    return;
-  }
-  renderDetail(d, hist);
 }
 
 function kv(k, v) { return v == null || v === "" ? "" : `<div><span class="k">${k}</span>${esc(v)}</div>`; }
@@ -644,7 +806,7 @@ function renderDetail(d, hist = []) {
     ${kv("owner", d.ownerUsername)}
     ${kv("published", (d.publishedUtc || "").slice(0, 10))}
     ${kv("visibility", d.visibility)}
-    ${kv("coords", d.location ? d.location.latitude.toFixed(5) + ", " + d.location.longitude.toFixed(5) : null)}
+    ${kv("entry coords", d.location ? d.location.latitude.toFixed(5) + ", " + d.location.longitude.toFixed(5) : null)}
     ${kv("guid", d.adventureGuid)}
   </div>${themes}</div>
   ${d.description ? `<div class="dsec"><h3>description</h3><div id="ddesc">${san(d.description)}</div></div>` : ""}
@@ -677,14 +839,14 @@ function renderStage(s, i, answers) {
   const ans = (answers || []).map(a =>
     `<div class="ans">A: <b>${esc(a.d || a.a)}</b> <span class="chip">${esc(a.m)}</span></div>`
   ).join("");
-  return `<div class="stage">
+  return `<div class="stage" id="stage-${i}" data-stage="${i}">
     <div class="st">${i + 1}. ${esc(s.title || "(untitled)")}
       <span class="chip">${esc(s.challengeType || "?")}</span></div>
     ${ans}
     ${s.question ? `<div class="sq"><span class="q">Q:</span> ${san(s.question)}</div>` : ""}
     ${s.description ? `<div class="sq sd">${san(s.description)}</div>` : ""}
-    <div class="sm">${L ? `📍 ${L.latitude.toFixed(5)}, ${L.longitude.toFixed(5)}` : ""}
-      ${s.geofencingRadius ? ` · r${s.geofencingRadius}m` : ""}${hashes}</div>
+    <div class="sm">${L ? `📍 stage ${L.latitude.toFixed(5)}, ${L.longitude.toFixed(5)}` : ""}
+      ${s.geofencingRadius != null ? ` · geofence ${s.geofencingRadius} m` : ""}${hashes}</div>
   </div>`;
 }
 
