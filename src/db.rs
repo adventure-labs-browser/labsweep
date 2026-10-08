@@ -258,7 +258,6 @@ pub struct CrackHit {
 /// One catalog/export row: a lab and its detail payload when fetched.
 pub struct CatalogRow {
     pub guid: String,
-    pub lab_json: Option<String>,
     pub adv_json: Option<String>,
     pub owner_username: Option<String>,
     pub reviews_total_count: Option<i64>,
@@ -1588,7 +1587,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             // Literal GLOB pattern (not a bound expr) so SQLite can use the
             // guid index for a range scan instead of a full-table scan.
             let mut stmt = c.prepare(&format!(
-                "SELECT l.guid, l.raw_json, a.raw_json, a.owner_username, \
+                "SELECT l.guid, a.raw_json, a.owner_username, \
                  a.reviews_total_count FROM labs l \
                  JOIN adventures a ON a.guid = l.guid \
                    AND a.raw_json <> '{{}}' \
@@ -1598,10 +1597,9 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
             let rows = stmt.query_map([], |r| {
                 Ok(CatalogRow {
                     guid: r.get(0)?,
-                    lab_json: r.get(1)?,
-                    adv_json: r.get(2)?,
-                    owner_username: r.get(3)?,
-                    reviews_total_count: r.get(4)?,
+                    adv_json: r.get(1)?,
+                    owner_username: r.get(2)?,
+                    reviews_total_count: r.get(3)?,
                 })
             })?;
             let mut out = Vec::new();
