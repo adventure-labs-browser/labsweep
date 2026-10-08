@@ -1591,7 +1591,7 @@ fn tombstone_stages(tx: &Transaction, guid: &str) -> Result<()> {
                 "SELECT l.guid, l.raw_json, a.raw_json, a.owner_username, \
                  a.reviews_total_count FROM labs l \
                  JOIN adventures a ON a.guid = l.guid \
-                   AND a.raw_json <> '{}' \
+                   AND a.raw_json <> '{{}}' \
                    AND COALESCE(a.status,'active') = 'active' \
                  WHERE l.guid GLOB '{prefix}*'",
             ))?;
