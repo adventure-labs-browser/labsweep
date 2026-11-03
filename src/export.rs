@@ -9,6 +9,8 @@
 //!
 //! Re-run after fetch/reviews finish to refresh the dataset.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +22,34 @@ use serde_json::{json, Map, Value};
 use tracing::info;
 
 use crate::db::Db;
+
+/// How many events land in changes.json.gz: the newest few, newest first.
+const RECENT_CHANGES_MAX: usize = 2_000;
+
+/// One recent-change candidate. Ordering covers only the timestamp and an
+/// insertion tiebreak so the heap can keep the newest RECENT_CHANGES_MAX.
+struct ChangeEvent {
+    at: String,
+    seq: u64,
+    value: Value,
+}
+
+impl PartialEq for ChangeEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at && self.seq == other.seq
+    }
+}
+impl Eq for ChangeEvent {}
+impl PartialOrd for ChangeEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ChangeEvent {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.at.cmp(&other.at).then(self.seq.cmp(&other.seq))
+    }
+}
 
 pub struct Args {
     /// Output directory (created if missing).
@@ -159,7 +189,10 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
     let mut history_bytes = 0u64;
     let mut history_events = 0usize;
     let mut history_shards = 0usize;
-    let mut recent_changes: Vec<Value> = Vec::new();
+    // Min-heap keyed by timestamp: memory stays bounded no matter how many
+    // history events the database holds.
+    let mut recent_changes: BinaryHeap<Reverse<ChangeEvent>> = BinaryHeap::new();
+    let mut recent_seq = 0u64;
     for i in 0u32..256 {
         let prefix = format!("{i:02x}");
         let rows = db.catalog_rows_prefix(prefix.clone()).await?;
@@ -200,7 +233,26 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
                         m.remove("d");
                         m.insert("g".into(), json!(guid));
                     }
-                    recent_changes.push(summary);
+                    let at = summary
+                        .get("at")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    recent_seq += 1;
+                    let candidate = ChangeEvent {
+                        at,
+                        seq: recent_seq,
+                        value: summary,
+                    };
+                    if recent_changes.len() < RECENT_CHANGES_MAX {
+                        recent_changes.push(Reverse(candidate));
+                    } else if recent_changes
+                        .peek()
+                        .is_some_and(|Reverse(oldest)| candidate.at > oldest.at)
+                    {
+                        recent_changes.pop();
+                        recent_changes.push(Reverse(candidate));
+                    }
                 }
             }
             let hpath = args.out.join("history").join(format!("{prefix}.json.gz"));
@@ -226,11 +278,14 @@ pub async fn run(db: Db, args: Args) -> Result<()> {
         shard_bytes as f64 / 1e6
     );
 
+    let mut recent_changes: Vec<Value> = recent_changes
+        .into_iter()
+        .map(|Reverse(e)| e.value)
+        .collect();
     recent_changes.sort_by(|a, b| {
         b.get("at").and_then(Value::as_str).unwrap_or("")
             .cmp(a.get("at").and_then(Value::as_str).unwrap_or(""))
     });
-    recent_changes.truncate(2_000);
     gz_write(&args.out.join("changes.json.gz"), &Value::Array(recent_changes))?;
 
     let generated_unix = std::time::SystemTime::now()
