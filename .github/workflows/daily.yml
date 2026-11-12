@@ -15,7 +15,21 @@ permissions:
   contents: write
 
 jobs:
+  gate:
+    # Cron cannot express "every 2 days". The schedule fires daily and this
+    # gate admits only even epoch days (UTC), giving a strict 48h cadence
+    # (e.g. Nov 13, Nov 15, ...). Manual dispatches always run.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.parity.outputs.run }}
+    steps:
+      - id: parity
+        run: |
+          d=$(( $(date -u +%s) / 86400 ))
+          if [ $((d % 2)) -eq 0 ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; fi
   refresh:
+    needs: gate
+    if: github.event_name != 'schedule' || needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
